@@ -50,28 +50,64 @@ def save_image(I, pool, output_path):
         input = vis_mask(input, mask, random_color(rgb=True))
     input.save(output_path)
 
-def main():
+def get_parser(inputs):
     parser = argparse.ArgumentParser(description="Detectron2 demo for builtin configs")
     parser.add_argument(
         "--config-file",
-        default="configs/maskformer2_R50_bs16_50ep.yaml",
+        default="configs/quick_schedules/mask_rcnn_R_50_FPN_inference_acc_test.yaml",
         metavar="FILE",
         help="path to config file",
     )
-    parser.add_argument("--input", type=str, help="path of input image")
-    parser.add_argument("--output", type=str, help="path to save output image")
-    parser.add_argument("--confidence_thresh", type=float, default=0.5, help="path to save output image")
     parser.add_argument(
         "--opts",
         help="Modify config options using the command-line 'KEY VALUE' pairs",
         default=[],
         nargs=argparse.REMAINDER,
     )
-    args = parser.parse_args()
+    parser.add_argument("--input", type=str, help="path of input image")
+    parser.add_argument("--output", type=str, help="path to save output image")
+    parser.add_argument("--confidence_thresh", type=float, default=0.5, help="confidence threshold for masks")
+    args = parser.parse_args(inputs)
+    return args
+
+def main():
+    # parser = argparse.ArgumentParser(description="Detectron2 demo for builtin configs")
+    # parser.add_argument(
+    #     "--config-file",
+    #     default="configs/maskformer2_R50_bs16_50ep.yaml",
+    #     metavar="FILE",
+    #     help="path to config file",
+    # )
+    # parser.add_argument("--input", type=str, help="path of input image")
+    # parser.add_argument("--output", type=str, help="path to save output image")
+    # parser.add_argument("--confidence_thresh", type=float, default=0.5, help="path to save output image")
+    # parser.add_argument(
+    #     "--opts",
+    #     help="Modify config options using the command-line 'KEY VALUE' pairs",
+    #     default=[],
+    #     nargs=argparse.REMAINDER,
+    # )
+    # args = parser.parse_args()
+    inputs = [
+        '--config-file', "whole_image_segmentation/configs/maskformer2_R50_bs16_50ep.yaml",
+        '--input', "docs/demos/sa_527160.jpg",
+        '--output', "output/demo_result.png",
+        "--opts", "MODEL.WEIGHTS", "whole_image_segmentation/ckpts/unsam_sa1b_4perc_ckpt_200k.pth",
+    ]
+    args = get_parser(inputs)
 
     pred = DefaultPredictor(setup(args))
     inputs = cv2.imread(args.input)
     pred.input_format = "BGR"
+
+    # With 2000 queries, sem_seg_postprocess upsamples all masks to the original
+    # image dimensions. For a 1500x2250 image that's 2000*1500*2250*4 ≈ 27 GiB.
+    # Resize to cap the longer side so the postprocessing tensor stays in VRAM.
+    MAX_SIDE = 1024
+    h, w = inputs.shape[:2]
+    if max(h, w) > MAX_SIDE:
+        scale = MAX_SIDE / max(h, w)
+        inputs = cv2.resize(inputs, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
     outputs = pred(inputs)['instances']
     masks = []
