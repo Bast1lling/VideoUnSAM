@@ -21,8 +21,8 @@ from tasks import interactive_infer_image_idino_m2m
 
 def parse_option():
     parser = argparse.ArgumentParser('UnSAM Demo', add_help=False)
-    parser.add_argument('--conf_files', default="configs/semantic_sam_only_sa-1b_swinL.yaml", metavar="FILE", help='path to config file', )
-    parser.add_argument('--ckpt', default="", metavar="FILE", help='path to ckpt', )
+    parser.add_argument('--conf_files', default="promptable_segmentation/configs/semantic_sam_only_sa-1b_swinT.yaml", metavar="FILE", help='path to config file', )
+    parser.add_argument('--ckpt', default="promptable_segmentation/ckpts/unsam_promptable_sa1b_4perc_ckpt.pth", metavar="FILE", help='path to ckpt', )
     parser.add_argument("--device", default="gpu", type=str)
     args = parser.parse_args()
 
@@ -50,7 +50,7 @@ device = args.device
 if device == 'cpu':
     model_sam = BaseModel(opt, build_model(opt)).from_pretrained(args.ckpt).eval().to('cpu')
 else:
-    model_sam = BaseModel(opt, build_model(opt)).from_pretrained(args.ckpt).eval().cuda()
+    model_sam = BaseModel(opt, build_model(opt)).from_pretrained(args.ckpt).eval().cuda()  # GeneralizedMaskDINO
 
 @torch.no_grad()
 def inference(image,text,text_part,text_thresh, *args, **kwargs):
@@ -136,9 +136,9 @@ with demo:
                 image.render()
             example = gr.Examples(
                 examples=[
-                    ["examples/sa_562217.jpg"],
-                    ["examples/sa_121371.jpg"],
-                    ["examples/sa_412497.jpg"],
+                    ["promptable_segmentation/examples/sa_562217.jpg"],
+                    ["promptable_segmentation/examples/sa_121371.jpg"],
+                    ["promptable_segmentation/examples/sa_412497.jpg"],
                 ],
                 inputs=image,
 

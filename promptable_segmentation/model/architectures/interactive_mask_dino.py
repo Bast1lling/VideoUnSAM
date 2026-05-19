@@ -88,10 +88,10 @@ class GeneralizedMaskDINO(nn.Module):
             test_topk_per_image: int, instance segmentation parameter, keep topk instances per image
         """
         super().__init__()
-        self.backbone = backbone
+        self.backbone = backbone  # D2SwinTransformer
         self.pano_temp = pano_temp
-        self.sem_seg_head = sem_seg_head
-        self.criterion = None
+        self.sem_seg_head = sem_seg_head  # IMaskDINOHead
+        self.criterion = None  # SetCriterionOsPartWholeM2M
         self.criterion_switch = criterion_switch
         self.num_queries = num_queries
         self.overlap_threshold = overlap_threshold
@@ -410,6 +410,10 @@ class GeneralizedMaskDINO(nn.Module):
             # mask classification target
             if "instances" in batched_inputs[0]:
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                # Here they take a list of gt masks (+ their bboxs and original image W,H)
+                # And they convert it to a list of tuples: (subsampled) mask, box, point
+                # So each gt instance is converted to all possible prompts
+                # Also if there are to few gt instances per img, they are repeated (or downsampled if too many)
                 targets = self.prepare_targets_interactive(gt_instances, images, prediction_switch=prediction_switch)
             else:
                 targets = None

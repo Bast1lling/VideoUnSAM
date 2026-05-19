@@ -45,8 +45,8 @@ class IMaskDINOHead(nn.Module):
         self.common_stride = 4
         self.loss_weight = loss_weight
 
-        self.pixel_decoder = pixel_decoder
-        self.predictor = transformer_predictor
+        self.pixel_decoder = pixel_decoder  # MaskDINOEncoder
+        self.predictor = transformer_predictor  # IMaskDINODecoder
 
         self.num_classes = num_classes
         # store processed features
