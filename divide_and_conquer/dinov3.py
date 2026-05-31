@@ -71,5 +71,5 @@ class ViTFeatV3(nn.Module):
 if __name__ == '__main__':
     model = ViTFeatV3(vit_feat='k')
     img = torch.zeros(2, 3, 448, 448, dtype=torch.float32)
-    feat = model(img)
+    feat = model(img.to("cuda"))
     print(feat.shape)  # [2, 1024, 784]  (448/16=28, 28²=784)

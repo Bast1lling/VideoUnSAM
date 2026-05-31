@@ -7,6 +7,7 @@ import numpy as np
 import segmentation_refinement as refine
 from tqdm import tqdm
 from torchvision import transforms
+import dinov3
 import dino
 import cv2
 
@@ -23,18 +24,20 @@ from divide_conquer import setup_cfg
 import warnings
 warnings.filterwarnings("ignore")
 
-def get_parser():
+def get_parser(yaml_path = "divide_and_conquer/model_zoo/configs/CutLER-ImageNet/cascade_mask_rcnn_R_50_FPN.yaml"):
     parser = argparse.ArgumentParser(description="")
     parser.add_argument(
         "--config-file",
-        default="model_zoo/configs/CutLER-ImageNet/cascade_mask_rcnn_R_50_FPN.yaml",
+        default=yaml_path,
         metavar="FILE",
     )
     # backbone args
-    parser.add_argument("--patch-size", default=8, type=int)
-    parser.add_argument("--feature-dim", default=768, type=int)
-    parser.add_argument("--backbone-size", default='base', type=str)
-    parser.add_argument("--backbone-url", default="https://dl.fbaipublicfiles.com/dino/dino_vitbase8_pretrain/dino_vitbase8_pretrain.pth", type=str)
+    parser.add_argument("--patch-size", default=16, type=int)
+    parser.add_argument("--feature-dim", default=1024, type=int)
+    parser.add_argument("--backbone-size", default='large', type=str)
+    parser.add_argument("--backbone-url", default="facebook/dinov3-vitl16-pretrain-lvd1689m", type=str)
+    parser.add_argument("--backbone", default="dinov3", choices=["dinov3", "dino"],
+                        help="conquer backbone: 'dinov3' (default) or legacy 'dino' (DINO-B/8)")
 
     parser.add_argument("--input", type=str)
     parser.add_argument("--output", type=str, default="pseudo_masks_output")
@@ -93,6 +96,7 @@ def coverage(mask1, mask2):
     return np.count_nonzero(np.logical_and(mask1, mask2)) / np.count_nonzero(mask1)
 
 def resize_mask(bipartition_masked, I_size):
+    # bilinearly interpolate 1*255 and then clamp them back to 0.0 or 1.0 with thresh
     # do preprocess the mask before put into the refiner
     bipartition_masked = Image.fromarray(np.uint8(bipartition_masked*255))
     bipartition_masked = np.asarray(bipartition_masked.resize(I_size))
@@ -106,6 +110,9 @@ def resize_mask(bipartition_masked, I_size):
     return bipartition_masked
 
 def smallest_square_containing_mask(mask):
+    """
+    Computes a mask's bounding box
+    """
     rows = np.any(mask, axis=1)
     cols = np.any(mask, axis=0)
 
@@ -126,14 +133,15 @@ def generate_feature_matrix(backbone, image, feat_dim, feat_num):
         tensor = ToTensor(image).unsqueeze(0)
         feat = backbone(tensor)[0]
     else:
-        tensor = ToTensor(image).unsqueeze(0).half()
+        tensor = ToTensor(image).unsqueeze(0).to(next(backbone.parameters()).dtype)
         tensor = tensor.cuda()
         feat = backbone(tensor)[0].cpu()
     feat_reshaped = feat.reshape(feat_dim, feat_num, feat_num)
     feat_reshaped = feat_reshaped.permute(1, 2, 0)
     return feat_reshaped
 
-def vis_mask(input, mask, mask_color) :
+def vis_mask(input, mask, mask_color):
+    # Extract foreground pixels and paint them mask_color
     fg = mask > 0.5
     rgb = np.copy(input)
     rgb[fg] = (rgb[fg] * 0.5 + np.array(mask_color) * 0.5).astype(np.uint8)
@@ -162,14 +170,19 @@ def main():
     cfg = setup_cfg(args)
     predictor = DefaultPredictor(cfg)
 
-    # load DINO backbone
-    backbone = dino.ViTFeat(args.backbone_url, args.feature_dim, args.backbone_size, 'k', args.patch_size)
+    if args.backbone == 'dinov3':
+        backbone = dinov3.ViTFeatV3(args.backbone_url, args.feature_dim, args.backbone_size, 'k', args.patch_size)
+    else:
+        backbone = dino.ViTFeat(args.backbone_url, args.feature_dim, args.backbone_size, 'k', args.patch_size)
     backbone.eval()
     if cfg.MODEL.DEVICE == 'cpu':
         assert not args.postprocess, "postprocess needs gpu"
         backbone.to('cpu')
     else:
-        backbone.cuda().to(torch.float16)
+        if args.backbone == 'dino':
+            backbone.cuda().half()
+        else:
+            backbone.cuda()  # already bfloat16 from ViTFeatV3.__init__
 
     segmentation_id = 1
 
@@ -178,7 +191,7 @@ def main():
     output["image"], output["annotations"] = {}, []
 
     # Image import
-    image_path = os.path.join(args.input)
+    image_path = os.path.join("docs/demos/sa_234337.jpg")
     image = cv2.imread(image_path)
     H, W = image.shape[:2]
 
