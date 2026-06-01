@@ -17,4 +17,8 @@ build/
 dist/
 output/
 docs/
-.idea/
+.idea/.venv/
+datasets/
+output/
+__pycache__/
+*.pyc
