@@ -30,6 +30,10 @@ from divide_conquer import (
     setup_cfg,
     NMS, coverage, resize_mask, smallest_square_containing_mask,
 )
+from dico import (
+    DEFAULT_LOCAL_SIZE, DEFAULT_KEPT_THRESH, DEFAULT_NMS_IOU,
+    DEFAULT_NMS_STEP, DEFAULT_THETAS,
+)
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -74,11 +78,11 @@ def get_parser():
     parser.add_argument("--confidence-threshold", type=float, default=0.1)
     parser.add_argument("--start-id", default=None, type=int)
     parser.add_argument("--end-id", default=None, type=int)
-    parser.add_argument("--local-size", default=512, type=int)
-    parser.add_argument("--kept-thresh", default=0.9, type=float)
-    parser.add_argument("--NMS-iou", default=0.9, type=float)
-    parser.add_argument("--NMS-step", default=5, type=int)
-    parser.add_argument("--thetas", default=[0.75, 0.65, 0.55, 0.45, 0.35, 0.25], type=list)
+    parser.add_argument("--local-size", default=DEFAULT_LOCAL_SIZE, type=int)
+    parser.add_argument("--kept-thresh", default=DEFAULT_KEPT_THRESH, type=float)
+    parser.add_argument("--NMS-iou", default=DEFAULT_NMS_IOU, type=float)
+    parser.add_argument("--NMS-step", default=DEFAULT_NMS_STEP, type=int)
+    parser.add_argument("--thetas", default=list(DEFAULT_THETAS), type=list)
     # Postprocess params
     parser.add_argument("--crop-ratio", default=2.0, type=float)
     parser.add_argument("--refine-scale", default=1, type=int)

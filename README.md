@@ -15,6 +15,98 @@ Unsupervised SAM (UnSAM) is a "segment anything" model for promptable and automa
 [[`project page`](https://people.eecs.berkeley.edu/~xdwang/projects/UnSAM/)] [[`arxiv`](http://arxiv.org/abs/2406.20081)] [[`colab (UnSAM)`](https://drive.google.com/file/d/1KyxbFb2JC76RZ1jg7F8Ee4TEmOlpYMe7/view?usp=sharing)] [[`colab (pseudo-label)`](https://drive.google.com/file/d/1aFObIt-xlQmCKk3G7dD8KQxaWhM_RTEd/view?usp=sharing)] [[`bibtex`](#citation)]             
 
 
+---
+
+## VideoUnSAM Extension
+
+Extending UnSAM into the temporal domain with DINOv3 features and Sinkhorn
+optimal-transport mask propagation. See `video/` for the new code.
+
+### Phase 1 — Static divide-and-conquer (DINOv3)
+
+CutLER divide → DINOv3 ViT-L/16 conquer on a single image.
+
+```bash
+# End-to-end on the demo image (writes a colored mask overlay)
+.venv/bin/python divide_and_conquer/demo_dico.py \
+  --backbone dinov3 --output pseudo_masks_output.png
+
+# Divide → conquer → synthetic stills video (UnSAM v1-style augmented "video")
+.venv/bin/python divide_and_conquer/divide_conquer_videoV3.py \
+  --input docs/demos/sa_234337.jpg \
+  --output-video output.mp4 --output-preview preview.png
+```
+
+### Phase 2 — Real-video propagation on DAVIS 2017
+
+DAVIS is expected at `datasets/davis/DAVIS/{JPEGImages,Annotations}/480p/<clip>/`.
+
+```bash
+# Sanity: DINOv3 patch-cosine map between two frames of a clip.
+# Pick a query patch in frame A; heatmap shows where DINOv3 thinks it went in B.
+.venv/bin/python -m video.scripts.visualize_frame_similarity \
+  --clip blackswan --frame-a 0 --frame-b 20 \
+  --query-xy 0.45 0.7 --out sim_blackswan.png
+
+# Single-hop OT mask propagation A → B.
+# Uses DAVIS GT at frame A as the source mask (stand-in for a Phase-1 pseudo-mask).
+# --upscale 2.0 doubles the DINOv3 feature grid for sharper boundaries.
+.venv/bin/python -m video.scripts.propagate_mask \
+  --clip blackswan --frame-a 0 --frame-b 20 --instance-id 1 \
+  --upscale 2.0 --out prop_blackswan.png
+
+# Same, but also runs SAM ViT-H as a *diagnostic* boundary refiner on the OT
+# output. Reports both OT and SAM IoU. NOT used in the pseudo-mask pipeline
+# downstream — SAM imports a supervised prior; we keep this here only to
+# visualise an "ideal refinement" ceiling. Requires the SAM checkpoint at
+# checkpoints/sam_vit_h_4b8939.pth.
+.venv/bin/python -m video.scripts.propagate_mask \
+  --clip bmx-trees --frame-a 0 --frame-b 15 --instance-id 1 \
+  --upscale 2.0 --sam --out bmx_sam.png
+
+# Chained-hop OT propagation: small strides with soft patch-level mass passed
+# through every hop (no mid-chain binarisation). Helps slightly on long
+# easy/medium clips, collapses on multi-instance hard clips (dogs-jump) —
+# that failure motivates the Phase-3 KV memory.
+.venv/bin/python -m video.scripts.propagate_chain \
+  --clip blackswan --frame-a 0 --frame-b 45 --stride 5 \
+  --instance-id 1 --upscale 2.0 --out chain_blackswan.png
+```
+
+#### One-time setup for Phase 2
+
+```bash
+# DAVIS 2017 trainval (~800 MB)
+mkdir -p datasets/davis && cd datasets/davis
+wget https://data.vision.ee.ethz.ch/csergi/share/davis/DAVIS-2017-trainval-480p.zip
+unzip -q DAVIS-2017-trainval-480p.zip && cd ../..
+
+# SAM diagnostic (only if you'll pass --sam)
+.venv/bin/pip install segment-anything
+mkdir -p checkpoints
+wget -O checkpoints/sam_vit_h_4b8939.pth https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
+
+# HuggingFace login for the gated DINOv3 weights
+huggingface-cli login
+```
+
+#### Common knobs
+
+- `--upscale {1.0, 2.0}` — DINOv3 feature-grid resolution; 2.0 is the practical default on a 5090.
+- `--blur 0.05` — Sinkhorn entropic regularisation; robust across 0.02–0.2.
+- `--threshold 0.5` — binarisation cutoff as a fraction of heatmap max.
+- `--instance-id N` — which DAVIS annotation instance to use as the source mask at frame A.
+
+### Status
+
+- Phase 1 ✅ (DINOv3 ViT-L/16, bf16, ~2.6 GB peak on 5090)
+- Phase 2 ✅ (single-hop OT + 2× upscale; chained-hop OT works on easy/medium, fails on multi-instance content)
+- Phase 3 — KV memory module (next)
+- Phase 4 — self-training loop
+- Phase 5 — DAVIS / YouTube-VOS evaluation
+
+---
+
 ## Updates
 - 11/19/2025 UnSAMv2 was released!!!! Check it out at: [GitHub](https://github.com/yujunwei04/UnSAMv2) & [UnSAMv2 project page](https://yujunwei04.github.io/UnSAMv2-Project-Page/)
 <img width="2476" height="1276" alt="image" src="https://github.com/user-attachments/assets/81597eec-12c4-4808-814e-61a51e246726" />        

@@ -28,7 +28,9 @@ Quickstart
 
 from __future__ import annotations
 
+import os
 import tempfile
+from types import SimpleNamespace
 from typing import Sequence
 
 import cv2
@@ -40,7 +42,6 @@ from demo_dico import (
     NMS,
     coverage,
     generate_feature_matrix,
-    get_parser as _get_dico_parser,
     resize_mask,
     smallest_square_containing_mask,
 )
@@ -50,6 +51,38 @@ from iterative_merging import iterative_merge
 import dinov3 as _dinov3
 import dino as _dino_module
 from synthetic_video import _build_aug_list, _aug_frame, _render_frame
+
+
+_DEFAULT_CFG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "model_zoo/configs/CutLER-ImageNet/cascade_mask_rcnn_R_50_FPN.yaml",
+)
+
+# Blessed backbone defaults — keep these in sync with divide_conquerV3.py CLI.
+_DINOV3_DEFAULTS = SimpleNamespace(
+    backbone_url="facebook/dinov3-vitl16-pretrain-lvd1689m",
+    backbone_size="large",
+    feature_dim=1024,
+    patch_size=16,
+)
+_DINOV1_DEFAULTS = SimpleNamespace(
+    backbone_url=(
+        "https://dl.fbaipublicfiles.com/dino/dino_vitbase8_pretrain/"
+        "dino_vitbase8_pretrain.pth"
+    ),
+    backbone_size="base",
+    feature_dim=768,
+    patch_size=8,
+)
+
+
+# Blessed conquer-phase defaults — single source of truth.
+# Both DiCoModel.conquer() and divide_conquerV3.py import from here.
+DEFAULT_LOCAL_SIZE = 512
+DEFAULT_KEPT_THRESH = 0.8
+DEFAULT_NMS_IOU = 0.8
+DEFAULT_NMS_STEP = 5
+DEFAULT_THETAS = (0.73, 0.62, 0.51, 0.40, 0.30, 0.20)
 
 
 # ── Colour palettes ──────────────────────────────────────────────────────────
@@ -354,29 +387,40 @@ class DiCoModel:
         self,
         weights_path: str,
         backbone_type: str = "dinov3",
-        dino_url: str = (
-            "https://dl.fbaipublicfiles.com/dino/dino_vitbase8_pretrain/"
-            "dino_vitbase8_pretrain.pth"
-        ),
+        device: str = "cuda",
+        confidence_threshold: float = 0.1,
+        nms_step: int = 5,
+        config_file: str = _DEFAULT_CFG_FILE,
+        backbone_dtype: torch.dtype = torch.bfloat16,
+        backbone_overrides: dict | None = None,
     ):
-        args = _get_dico_parser(
-            yaml_path="model_zoo/configs/CutLER-ImageNet/cascade_mask_rcnn_R_50_FPN.yaml"
-        ).parse_args(["--opts", "MODEL.WEIGHTS", weights_path, "MODEL.DEVICE", "cuda"])
+        defaults = _DINOV3_DEFAULTS if backbone_type == "dinov3" else _DINOV1_DEFAULTS
+        cfg_attrs = vars(defaults).copy()
+        if backbone_overrides:
+            cfg_attrs.update(backbone_overrides)
+        cfg_attrs["nms_step"] = nms_step
+        self._cfg = SimpleNamespace(**cfg_attrs)
 
-        cfg = setup_cfg(args)
-        self.predictor = DefaultPredictor(cfg)
-        self._args = args
+        # Build the detectron2 cfg without round-tripping through argparse.
+        d2_args = SimpleNamespace(
+            config_file=config_file,
+            opts=["MODEL.WEIGHTS", weights_path, "MODEL.DEVICE", device],
+            confidence_threshold=confidence_threshold,
+        )
+        self.predictor = DefaultPredictor(setup_cfg(d2_args))
 
         if backbone_type == "dinov3":
             self.backbone = _dinov3.ViTFeatV3(
-                args.backbone_url, args.feature_dim, args.backbone_size, "k", args.patch_size,
+                self._cfg.backbone_url, self._cfg.feature_dim,
+                self._cfg.backbone_size, "k", self._cfg.patch_size,
             )
-            self.backbone.eval().cuda()
+            self.backbone.eval().to(device=device, dtype=backbone_dtype)
         else:
-            self.backbone = _dino_module.ViTFeat(dino_url, 768, "base", "k", 8)
-            self.backbone.eval().cuda().half()
-            self._args.feature_dim = 768
-            self._args.patch_size = 8
+            self.backbone = _dino_module.ViTFeat(
+                self._cfg.backbone_url, self._cfg.feature_dim,
+                self._cfg.backbone_size, "k", self._cfg.patch_size,
+            )
+            self.backbone.eval().to(device=device, dtype=backbone_dtype)
 
     # ── Divide ───────────────────────────────────────────────────────────────
 
@@ -405,10 +449,10 @@ class DiCoModel:
         image_rgb: np.ndarray,
         divide_masks: list[np.ndarray],
         mask_idx: int,
-        local_size: int = 512,
-        kept_thresh: float = 0.8,
-        nms_iou: float = 0.8,
-        thetas: Sequence[float] = (0.73, 0.62, 0.51, 0.4, 0.3, 0.2),
+        local_size: int = DEFAULT_LOCAL_SIZE,
+        kept_thresh: float = DEFAULT_KEPT_THRESH,
+        nms_iou: float = DEFAULT_NMS_IOU,
+        thetas: Sequence[float] = DEFAULT_THETAS,
     ) -> list[np.ndarray]:
         """
         Run the conquer phase for a single divide mask.
@@ -441,9 +485,9 @@ class DiCoModel:
         local_rgb = image_rgb[ymin:ymax, xmin:xmax]
         resized = Image.fromarray(local_rgb).resize([local_size, local_size])
 
-        feat_num = local_size // self._args.patch_size
+        feat_num = local_size // self._cfg.patch_size
         feat_matrix = generate_feature_matrix(
-            self.backbone, resized, self._args.feature_dim, feat_num
+            self.backbone, resized, self._cfg.feature_dim, feat_num
         )
 
         conquer_masks: list[np.ndarray] = []
@@ -459,16 +503,16 @@ class DiCoModel:
                 full[ymin:ymax, xmin:xmax] = mask_bin
                 conquer_masks.append(full)
 
-        return NMS(conquer_masks, nms_iou, self._args.NMS_step)
+        return NMS(conquer_masks, nms_iou, self._cfg.nms_step)
 
     def conquer_all(
         self,
         image_rgb: np.ndarray,
         divide_masks: list[np.ndarray],
-        local_size: int = 512,
-        kept_thresh: float = 0.8,
-        nms_iou: float = 0.8,
-        thetas: Sequence[float] = (0.73, 0.62, 0.51, 0.4, 0.3, 0.2),
+        local_size: int = DEFAULT_LOCAL_SIZE,
+        kept_thresh: float = DEFAULT_KEPT_THRESH,
+        nms_iou: float = DEFAULT_NMS_IOU,
+        thetas: Sequence[float] = DEFAULT_THETAS,
     ) -> dict[int, list[np.ndarray]]:
         """
         Run conquer on every divide mask and return results grouped by divide index.
@@ -523,11 +567,12 @@ class DiCoModel:
         ymin, ymax, xmin, xmax = smallest_square_containing_mask(divide_mask)
         local_rgb = image_rgb[ymin:ymax, xmin:xmax]
         resized = Image.fromarray(local_rgb).resize([local_size, local_size])
-        feat_num = local_size // self._args.patch_size
+        feat_num = local_size // self._cfg.patch_size
         feat_matrix = generate_feature_matrix(
-            self.backbone, resized, self._args.feature_dim, feat_num
+            self.backbone, resized, self._cfg.feature_dim, feat_num
         )
-        feat_np = feat_matrix.numpy() if hasattr(feat_matrix, "numpy") else feat_matrix
+        # .float() before .numpy() — bf16/fp16 tensors don't convert directly.
+        feat_np = feat_matrix.float().numpy() if hasattr(feat_matrix, "numpy") else feat_matrix
         return feature_pca_rgb(feat_np, upsample_to=local_rgb.shape[:2])
 
 
@@ -540,10 +585,10 @@ if __name__ == "__main__":
     BACKBONE     = "dinov3"          # "dinov3" or "dino"
     OUT_DIR      = "output"
 
-    LOCAL_SIZE   = 512
-    KEPT_THRESH  = 0.8
-    NMS_IOU      = 0.8
-    THETAS       = [0.73, 0.62, 0.51, 0.4, 0.3, 0.2]
+    LOCAL_SIZE   = DEFAULT_LOCAL_SIZE
+    KEPT_THRESH  = DEFAULT_KEPT_THRESH
+    NMS_IOU      = DEFAULT_NMS_IOU
+    THETAS       = list(DEFAULT_THETAS)
 
     NUM_FRAMES   = 8
     CROP_MIN     = 0.5
