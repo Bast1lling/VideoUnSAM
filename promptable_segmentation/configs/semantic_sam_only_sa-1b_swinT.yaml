@@ -38,7 +38,7 @@ MODEL:
     AUTOGRESSIVE: True
   BACKBONE:
     NAME: swin
-    PRETRAINED: 'promptable_segmentation/ckpts/unsam_promptable_sa1b_4perc_ckpt.pth'
+    PRETRAINED: 'ckpts/unsam_promptable_sa1b_4perc_ckpt.pth'
     LOAD_PRETRAINED: true
     SWIN:
       PRETRAIN_IMG_SIZE: 224

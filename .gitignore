@@ -22,3 +22,7 @@ datasets/
 output/
 __pycache__/
 *.pyc
+
+.idea/
+maskcut/
+wandb/

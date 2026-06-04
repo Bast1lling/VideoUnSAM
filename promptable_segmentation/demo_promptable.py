@@ -21,8 +21,8 @@ from tasks import interactive_infer_image_idino_m2m
 
 def parse_option():
     parser = argparse.ArgumentParser('UnSAM Demo', add_help=False)
-    parser.add_argument('--conf_files', default="promptable_segmentation/configs/semantic_sam_only_sa-1b_swinT.yaml", metavar="FILE", help='path to config file', )
-    parser.add_argument('--ckpt', default="promptable_segmentation/ckpts/unsam_promptable_sa1b_4perc_ckpt.pth", metavar="FILE", help='path to ckpt', )
+    parser.add_argument('--conf_files', default="configs/semantic_sam_only_sa-1b_swinT.yaml", metavar="FILE", help='path to config file', )
+    parser.add_argument('--ckpt', default="ckpts/unsam_promptable_sa1b_4perc_ckpt.pth", metavar="FILE", help='path to ckpt', )
     parser.add_argument("--device", default="gpu", type=str)
     args = parser.parse_args()
 
@@ -136,9 +136,9 @@ with demo:
                 image.render()
             example = gr.Examples(
                 examples=[
-                    ["promptable_segmentation/examples/sa_562217.jpg"],
-                    ["promptable_segmentation/examples/sa_121371.jpg"],
-                    ["promptable_segmentation/examples/sa_412497.jpg"],
+                    ["examples/sa_562217.jpg"],
+                    ["examples/sa_121371.jpg"],
+                    ["examples/sa_412497.jpg"],
                 ],
                 inputs=image,
 
