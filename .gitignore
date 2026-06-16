@@ -1,6 +1,12 @@
 *.pth
-*.json
 *.pyc
+
+# json outputs (annotation files, sweep results) but NOT code-adjacent json like davis_split.json
+divide_and_conquer/output/
+divide_and_conquer/pseudo_masks*/
+video/decoder/pseudo_dataset*/
+sweeps/
+logs/
 
 eval_output
 
@@ -17,8 +23,13 @@ build/
 dist/
 output/
 docs/
-.idea/.venv/
 datasets/
-output/
+
+# generated outputs
+*.mp4
+*.png
 __pycache__/
-*.pyc
+
+# environment
+.venv/
+.idea/

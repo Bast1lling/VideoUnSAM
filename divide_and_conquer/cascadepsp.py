@@ -17,6 +17,8 @@ def iou(mask1, mask2):
 def postprocess(args, refiner, annotations, image):
     H, W = image.shape[:2]
 
+    if not annotations["annotations"]:        # image yielded no pseudo-masks — skip
+        return annotations
     start_id = annotations["annotations"][0]['id']
     curr_id = 0
     refined_annotations = []
