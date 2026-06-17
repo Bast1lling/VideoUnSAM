@@ -33,3 +33,8 @@ __pycache__/
 # environment
 .venv/
 .idea/
+*.pyc
+
+.idea/
+maskcut/
+wandb/

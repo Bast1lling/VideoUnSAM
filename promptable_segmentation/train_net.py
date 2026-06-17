@@ -29,7 +29,7 @@ from detectron2.utils.logger import setup_logger
 from detectron2.config import LazyConfig, instantiate
 
 # dataloader and evaluator
-from datasets import (
+from unsam_datasets import (
     build_train_dataloader,
     build_evaluator,
     build_eval_dataloader,
