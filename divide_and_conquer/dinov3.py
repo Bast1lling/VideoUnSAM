@@ -32,6 +32,7 @@ class ViTFeatV3(nn.Module):
         vit_arch: str = 'large',
         vit_feat: str = 'k',               # k / q / v / kqv
         patch_size: int = _PATCH_SIZE,
+        attn_implementation: str = 'sdpa',  # use 'eager' to enable output_attentions
     ):
         super().__init__()
         self.pretrained_pth = pretrained_pth  # kept for API compat; weights come from HF
@@ -43,7 +44,7 @@ class ViTFeatV3(nn.Module):
         self.model = AutoModel.from_pretrained(
             _MODEL_ID,
             device_map='cuda',
-            attn_implementation='sdpa',
+            attn_implementation=attn_implementation,
             trust_remote_code=True,
         )
         self.model.eval()
@@ -66,6 +67,27 @@ class ViTFeatV3(nn.Module):
             feats = feats.repeat(1, 3, 1)  # [B, 3*feat_dim, n_spatial]
 
         return feats
+
+    @torch.no_grad()
+    def forward_with_attention(self, img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (feats [B, feat_dim, n_spatial], cls_attn [B, n_spatial]).
+
+        cls_attn is the last-layer attention from the CLS token to the spatial
+        patches, averaged over heads — an unsupervised objectness map. Requires
+        the model loaded with attn_implementation='eager'.
+        """
+        b, _, h, w = img.shape
+        feat_h = h // self.patch_size
+        feat_w = w // self.patch_size
+        n_spatial = feat_h * feat_w
+
+        outputs = self.model(pixel_values=img, output_attentions=True)
+        spatial = outputs.last_hidden_state[:, _N_PREFIX_TOKENS:]
+        feats = spatial.transpose(1, 2).reshape(b, self.feat_dim, n_spatial)
+
+        # attentions[-1]: [B, heads, T, T]; row 0 = CLS, cols _N_PREFIX_TOKENS: = patches
+        attn = outputs.attentions[-1][:, :, 0, _N_PREFIX_TOKENS:].mean(1)  # [B, n_spatial]
+        return feats, attn
 
 
 if __name__ == '__main__':

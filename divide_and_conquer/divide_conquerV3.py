@@ -10,6 +10,7 @@ Key differences from divide_conquer.py:
 import argparse
 import json
 import os
+import sys
 
 import cv2
 import numpy as np
@@ -64,6 +65,12 @@ def get_parser():
         default="model_zoo/configs/CutLER-ImageNet/cascade_mask_rcnn_R_50_FPN.yaml",
         metavar="FILE",
     )
+    # Divide-stage detector: cutler (frozen, default) or cuvler (unsupervised upgrade,
+    # measured DAVIS mask-AR 0.49 vs cutler 0.37). See video/divide/cuvler_divide.py.
+    parser.add_argument("--divide-method", default="cutler", choices=["cutler", "cuvler"])
+    parser.add_argument("--cuvler-weights", default=None, type=str,
+                        help="Override CuVLER weights (default: vendored cuvler_self_trained.pth).")
+    parser.add_argument("--cuvler-score", default=0.35, type=float)
     # DINOv3 backbone
     parser.add_argument("--patch-size", default=16, type=int)
     parser.add_argument("--feature-dim", default=1024, type=int)
@@ -155,17 +162,31 @@ def main():
             args.end_id = len(os.listdir(args.input_dir))
         os.makedirs(args.output_dir, exist_ok=True)
 
-        cfg = setup_cfg(args)
-        predictor = DefaultPredictor(cfg)
+        if args.divide_method == "cuvler":
+            # Import the vendored CuVLER detector. Uses cad.modeling, which does NOT
+            # clash with this repo's divide_and_conquer.modeling as long as the latter
+            # is not also imported (the conquer helpers don't import it).
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
+            from video.divide.cuvler_divide import CuVLERDivider
+            kw = {"score_thresh": args.cuvler_score}
+            if args.cuvler_weights:
+                kw["weights"] = args.cuvler_weights
+            divider = CuVLERDivider(**kw)
+            predictor = None
+            device = "cuda"
+        else:
+            cfg = setup_cfg(args)
+            predictor = DefaultPredictor(cfg)
+            divider = None
+            device = "cpu" if cfg.MODEL.DEVICE == "cpu" else "cuda"
 
         backbone = dinov3.ViTFeatV3(
             args.backbone_url, args.feature_dim, args.backbone_size, "k", args.patch_size
         )
         backbone.eval()
-        if cfg.MODEL.DEVICE == "cpu":
-            backbone.to("cpu")
-        else:
-            backbone.cuda()
+        backbone.to(device)
 
         segmentation_id = 1
         cnt = 0
@@ -185,11 +206,16 @@ def main():
             image = cv2.imread(os.path.join(args.input_dir, image_name))
             H, W = image.shape[:2]
 
-            predictions = predictor(image)
-            divide_masks_tensor = predictions["instances"].get("pred_masks")
-            divide_masks = [divide_masks_tensor[i].cpu().numpy() for i in range(divide_masks_tensor.shape[0])]
+            if divider is not None:
+                divide_masks = divider.predict(image[:, :, ::-1])  # predict() expects RGB
+            else:
+                predictions = predictor(image)
+                divide_masks_tensor = predictions["instances"].get("pred_masks")
+                divide_masks = [divide_masks_tensor[i].cpu().numpy() for i in range(divide_masks_tensor.shape[0])]
 
-            divide_conquer_masks, _ = run_conquer(backbone, image, divide_masks, args)
+            # DINOv3 (conquer) expects RGB; cv2.imread gives BGR. The CutLER predictor
+            # above needs BGR, so flip only for the conquer feature extraction.
+            divide_conquer_masks, _ = run_conquer(backbone, image[:, :, ::-1], divide_masks, args)
 
             output["image"] = create_image_info(image_id, image_name, (H, W, 3))
             for m in divide_conquer_masks:

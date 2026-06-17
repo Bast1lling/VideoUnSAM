@@ -25,7 +25,9 @@ from detectron2.data.datasets.coco import register_coco_instances
 
 _PREDEFINED_SPLITS_UNSAM_SA1B = {}
 _PREDEFINED_SPLITS_UNSAM_SA1B["unsam_sa1b"] = {
-    "unsam_sa1b_val": ("sa1b/images", "sa1b/annotations/sa1b_val.json"),
+    # DAVIS smoke set: CuVLER+conquer pseudo-masks (val == train for the smoke run).
+    "unsam_sa1b_train": ("davis_pseudo/images", "davis_pseudo/annotations/train.json"),
+    "unsam_sa1b_val": ("davis_pseudo/images", "davis_pseudo/annotations/train.json"),
 }
 
 def register_all_unsam_sa1b(root):
