@@ -1,0 +1,26 @@
+split: train
+res: 1024
+layer: final_norm
+apply_norm: true
+pca: 128
+whiten: false
+smooth: 0
+metric: cosine
+connectivity: 4
+radii:
+- 1
+l2_normalize: false
+display_q: 0.02
+sharpen: 0.5
+upscale: nearest
+seg_by: quantile
+seg_q: 0.7
+seg_thr: 1
+seg_min: 5
+seg_seed: 0
+seg_alpha: 0.55
+merge_thr: 0.75
+merge_mode: boundary
+merge_by: quantile
+merge_q: 0.75
+seam_thickness: 4

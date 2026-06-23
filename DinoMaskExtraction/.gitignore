@@ -1,0 +1,62 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.ipynb_checkpoints/
+
+# --- uv / virtualenv ---
+.venv/
+venv/
+env/
+# uv.lock IS committed on purpose (reproducible env) -- do not ignore it.
+
+# --- Caches / tooling ---
+.cache/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+
+# --- ML / model artifacts ---
+# Hugging Face weights are large; let them live in the shared HF cache, not the repo.
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+.hf_cache/
+wandb/
+runs/
+outputs/
+checkpoints/
+lightning_logs/
+
+# --- Data (never commit the ImageNet tree) ---
+data/
+*.JPEG
+*.jpeg
+*.jpg
+*.png
+*.npy
+*.npz
+# but keep the paper that lives in the repo root
+!dinov3_paper.pdf
+
+# --- Gradio ---
+.gradio/
+flagged/
+gradio_cached_examples/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
