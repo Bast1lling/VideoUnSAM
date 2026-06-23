@@ -74,6 +74,18 @@ from promptable_video_segmentation.model.video_mask_dino import (
     load_image_weights,
     freeze_non_temporal,
 )
+from promptable_video_segmentation.model.video_memory_mask_dino import (
+    VideoMemoryIMaskDINOHead,
+    load_image_weights as load_image_weights_memory,
+    freeze_non_memory,
+)
+
+# Map --variant → (head class, weight loader, base-freeze fn, new-param prefix).
+# Both heads share the same forward I/O contract, so the train loop is identical.
+_VARIANTS = {
+    "temporal": (VideoIMaskDINOHead,       load_image_weights,        freeze_non_temporal, "temporal_layers"),
+    "memory":   (VideoMemoryIMaskDINOHead, load_image_weights_memory, freeze_non_memory,   "memory_layers"),
+}
 
 _PRED_SWITCH = {"part": False, "whole": False, "seg": True, "det": True}
 
@@ -103,11 +115,13 @@ def _load_backbone_weights(backbone, weights_path: str, device: str) -> None:
               f"(first 5: {real_missing[:5]})")
 
 
-def build_model(config_path: str, weights_path: str, device: str):
+def build_model(config_path: str, weights_path: str, device: str, variant: str = "temporal"):
     """Build backbone + (no) language encoder + video head, load baseline weights."""
     from promptable_segmentation.utils.arguments import load_opt_from_config_file
     from promptable_segmentation.model.backbone import build_backbone
     from semantic_sam.language import build_language_encoder
+
+    head_cls, load_weights, _, new_prefix = _VARIANTS[variant]
 
     opt = load_opt_from_config_file(config_path)
 
@@ -123,18 +137,18 @@ def build_model(config_path: str, weights_path: str, device: str):
     if lang_encoder is not None:
         lang_encoder.to(device).eval()
 
-    print("Building VideoIMaskDINOHead …")
+    print(f"Building {head_cls.__name__} (variant='{variant}') …")
     extra = {"task_switch": {"bbox": True, "mask": True}}
-    head = VideoIMaskDINOHead(opt, backbone.output_shape(), lang_encoder, extra).to(device)
+    head = head_cls(opt, backbone.output_shape(), lang_encoder, extra).to(device)
 
     if os.path.exists(weights_path):
         print(f"Loading baseline weights from {weights_path} …")
         _load_backbone_weights(backbone, weights_path, device)
-        missing, _ = load_image_weights(head, weights_path, map_location=device)
-        n_other = sum(1 for k in missing if "temporal_layers" not in k)
+        missing, _ = load_weights(head, weights_path, map_location=device)
+        n_other = sum(1 for k in missing if new_prefix not in k)
         if n_other:
-            other = [k for k in missing if "temporal_layers" not in k][:5]
-            print(f"  [warn] {n_other} non-temporal head keys missing (first 5: {other})")
+            other = [k for k in missing if new_prefix not in k][:5]
+            print(f"  [warn] {n_other} non-{new_prefix} head keys missing (first 5: {other})")
     else:
         print(f"[warn] weights not found at {weights_path}; using random init.")
 
@@ -142,9 +156,9 @@ def build_model(config_path: str, weights_path: str, device: str):
     return backbone, head, opt, num_mask_tokens
 
 
-def set_trainable(head: torch.nn.Module, mode: str) -> None:
+def set_trainable(head: torch.nn.Module, mode: str, variant: str = "temporal") -> None:
     """Select which parameters to finetune."""
-    freeze_non_temporal(head)   # baseline: only temporal_layers.*
+    _VARIANTS[variant][2](head)   # baseline: only the variant's new layers (temporal/memory)
     if mode in ("heads", "decoder"):
         for name, p in head.named_parameters():
             if any(k in name for k in ("mask_embed", "iou_prediction_head",
@@ -448,7 +462,7 @@ def main() -> None:
         help="Directory of precomputed .npz masks (searched recursively).")
     ap.add_argument("--weights", default=str(_THIS / "ckpts" / "baseline.pth"))
     ap.add_argument("--config",  default=str(_THIS / "configs" / "video_sam_swinT.yaml"))
-    ap.add_argument("--output-dir", default=str(_THIS / "output" / "video_ft"))
+    ap.add_argument("--output-dir", default=str(_THIS / "output" / "memory_video_ft"))
     ap.add_argument("--ckpt-dir", default=None,
         help="folder to save every epoch's checkpoint into "
              "(default: <output-dir>/checkpoints)")
@@ -462,16 +476,25 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight-decay", type=float, default=0.05)
     ap.add_argument("--grad-clip", type=float, default=0.01)
-    ap.add_argument("--num-workers", type=int, default=8)
+    ap.add_argument("--num-workers", type=int, default=12)
+    ap.add_argument("--prefetch-factor", type=int, default=4,
+        help="batches each worker prefetches (DataLoader); higher hides I/O jitter")
+    ap.add_argument("--max-masks", type=int, default=24,
+        help="cap the mask pool per clip before augmentation (median ~60/file). "
+             "Only a few become prompts, so augmenting all of them is wasted CPU. "
+             "Keep >= --num-prompts; 0 disables the cap.")
     ap.add_argument("--image-size", type=int, default=512,
         help="resize every frame to this fixed square size (multiple of 32). "
              "Uniform sizes remove collate-padding waste, stabilise GPU memory, "
              "and speed up cuDNN. Use 0 to keep each image's native resolution.")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--variant", choices=["temporal", "memory"], default="temporal",
+        help="temporal=per-query TemporalSelfAttention (video_mask_dino); "
+             "memory=mask-conditioned memory read (video_memory_mask_dino)")
     ap.add_argument("--unfreeze", choices=["temporal", "heads", "decoder"],
         default="temporal",
-        help="temporal=only temporal layers; heads=+mask/iou/box heads; "
-             "decoder=+entire transformer decoder")
+        help="temporal=only the variant's new (temporal/memory) layers; "
+             "heads=+mask/iou/box heads; decoder=+entire transformer decoder")
     ap.add_argument("--use-divide", action="store_true", default=True)
     ap.add_argument("--no-conquer", dest="use_conquer", action="store_false", default=True)
     ap.add_argument("--crop-min", type=float, default=0.5)
@@ -500,6 +523,10 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("This model requires CUDA (the decoder allocates .cuda() tensors).")
     device = "cuda"
+    # With a fixed --image-size every batch is the same shape, so let cuDNN
+    # autotune (and cache) the fastest conv kernels instead of re-picking each
+    # step.  Disabled for variable sizes, where it would re-benchmark constantly.
+    torch.backends.cudnn.benchmark = args.image_size > 0
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -523,23 +550,30 @@ def main() -> None:
         use_conquer=args.use_conquer, crop_min=args.crop_min, max_size=args.max_size,
         require_all_frames=args.require_all_frames,
         image_size=(args.image_size if args.image_size > 0 else None),
+        max_masks=(args.max_masks if args.max_masks > 0 else None),
     )
     train_ds = DiCoVideoDataset(entries=train_files, **ds_kwargs)
     val_ds   = DiCoVideoDataset(entries=val_files,   **ds_kwargs)
 
     collate = lambda b: collate_video_clips(b, size_divisibility=32)
+    # pin_memory + persistent workers + deeper prefetch keep the (CPU-heavy)
+    # augmentation pipeline ahead of the GPU so it doesn't stall between batches.
+    loader_kwargs = dict(num_workers=args.num_workers, collate_fn=collate,
+                         pin_memory=True)
+    if args.num_workers > 0:
+        loader_kwargs.update(persistent_workers=True,
+                             prefetch_factor=args.prefetch_factor)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, collate_fn=collate,
-                              drop_last=False)
+                              drop_last=False, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, collate_fn=collate)
+                            **loader_kwargs)
 
     # ── model ─────────────────────────────────────────────────────────────────────
-    backbone, head, opt, M = build_model(args.config, args.weights, device)
+    backbone, head, opt, M = build_model(args.config, args.weights, device, args.variant)
     backbone.eval()   # backbone is frozen throughout
     for p in backbone.parameters():
         p.requires_grad = False
-    set_trainable(head, args.unfreeze)
+    set_trainable(head, args.unfreeze, args.variant)
 
     trainable = [p for p in head.parameters() if p.requires_grad]
     n_train = sum(p.numel() for p in trainable)
@@ -620,16 +654,20 @@ if __name__ == "__main__":
 
 """
 python promptable_video_segmentation/train_video.py \
-  --mask-dir /home/sebastian/data/imagenet1k/masksV3/validation \
-  --frames 2 --epochs 5 --num-prompts 8 --batch-size 6 \
-  --output-dir promptable_video_segmentation/output/video_ft_v3 \
-  --wandb --wandb-project unsam-video-ft --wandb-run-name v3_temporal
+  --mask-dir /home/sebastian/data/imagenet1k/masksV1/validation \
+  --output-dir promptable_video_segmentation/output/video_ft_memory \
+  --frames 3 --epochs 5 --image-size 512 --batch-size 8 --amp \
+  --num-workers 14 --prefetch-factor 6 --max-masks 8 \
+  --variant memory --unfreeze decoder \
+  --wandb --wandb-project unsam-video-ft --wandb-run-name v1_memory
 
   
 python promptable_video_segmentation/train_video.py \
   --mask-dir /home/sebastian/data/imagenet1k/masksV1/validation \
-  --frames 3 --epochs 25 \
+  --output-dir promptable_video_segmentation/output/video_ft \
+  --frames 3 --epochs 5 \
   --image-size 512 --batch-size 8 --amp --num-workers 8 \
-  --wandb --wandb-project unsam-video-ft --wandb-run-name v1_temporal
+  --wandb --wandb-project unsam-video-ft --wandb-run-name v1_temporal \
+  --unfreeze decoder
 
 """

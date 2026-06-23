@@ -111,26 +111,50 @@ def _to_model_hw(h: int, w: int) -> tuple[int, int]:
     return new_h, new_w
 
 
-def _load_seg_model(config_path: str, weights_path: str, device: str,
-                    finetuned_path: str = ""):
+def _detect_variant(finetuned_path: str) -> str:
     """
-    Build + cache VideoIMaskDINOHead.
+    Infer which video variant a finetuned checkpoint belongs to by peeking at its
+    keys: ``memory_layers.*`` → memory, ``temporal_layers.*`` → temporal.
+    Baseline-only (no finetuned ckpt) defaults to temporal (the new layers are
+    inert there anyway).
+    """
+    if not finetuned_path or not os.path.exists(finetuned_path):
+        return "temporal"
+    sd = torch.load(finetuned_path, map_location="cpu")
+    sd = sd.get("model", sd)
+    if any("memory_layers" in k for k in sd):
+        return "memory"
+    if any("temporal_layers" in k for k in sd):
+        return "temporal"
+    return "temporal"
+
+
+def _load_seg_model(config_path: str, weights_path: str, device: str,
+                    finetuned_path: str = "", variant: str = "temporal"):
+    """
+    Build + cache the video head for the requested *variant*
+    (``temporal`` → VideoIMaskDINOHead, ``memory`` → VideoMemoryIMaskDINOHead).
 
     Always loads the baseline (backbone + full image-model head).  If
-    *finetuned_path* is given, the finetuned checkpoint (temporal layers + any
-    unfrozen heads, saved by train_video.py) is overlaid on top with
+    *finetuned_path* is given, the finetuned checkpoint (the variant's new layers
+    + any unfrozen heads, saved by train_video.py) is overlaid on top with
     strict=False, so picking a checkpoint runs *that* finetuned model.
     """
-    key = (config_path, weights_path, device, finetuned_path)
+    key = (config_path, weights_path, device, finetuned_path, variant)
     if _seg_model_cache.get("_key") == key:
         return _seg_model_cache["backbone"], _seg_model_cache["head"]
 
     from promptable_segmentation.utils.arguments import load_opt_from_config_file
     from promptable_segmentation.model.backbone import build_backbone
     from semantic_sam.language import build_language_encoder
-    from promptable_video_segmentation.model.video_mask_dino import (
-        VideoIMaskDINOHead, load_image_weights,
-    )
+    if variant == "memory":
+        from promptable_video_segmentation.model.video_memory_mask_dino import (
+            VideoMemoryIMaskDINOHead as _HeadCls, load_image_weights,
+        )
+    else:
+        from promptable_video_segmentation.model.video_mask_dino import (
+            VideoIMaskDINOHead as _HeadCls, load_image_weights,
+        )
 
     opt = load_opt_from_config_file(config_path)
     # Disable the YAML auto-loader: baseline.pth keys are prefixed
@@ -145,7 +169,7 @@ def _load_seg_model(config_path: str, weights_path: str, device: str,
     if lang_encoder is not None:
         lang_encoder.to(device).eval()
 
-    head = VideoIMaskDINOHead(
+    head = _HeadCls(
         opt, backbone.output_shape(), lang_encoder,
         {"task_switch": {"bbox": True, "mask": True}},
     ).to(device)
@@ -167,9 +191,13 @@ def _load_seg_model(config_path: str, weights_path: str, device: str,
         ft = torch.load(finetuned_path, map_location=device)
         ft_sd = ft.get("model", ft)
         missing, unexpected = head.load_state_dict(ft_sd, strict=False)
-        print(f"[seg] overlaid finetuned ckpt {os.path.basename(finetuned_path)}: "
-              f"{len(ft_sd)} tensors (epoch={ft.get('epoch', '?')}, "
+        print(f"[seg] overlaid finetuned ckpt {os.path.basename(finetuned_path)} "
+              f"(variant={variant}): {len(ft_sd)} tensors (epoch={ft.get('epoch', '?')}, "
               f"{len(unexpected)} unexpected)")
+        if unexpected:
+            print(f"[seg] WARNING: {len(unexpected)} unexpected keys — likely a "
+                  f"variant mismatch (first 3: {unexpected[:3]}). The finetuned "
+                  f"layers may not be active.")
     elif finetuned_path:
         print(f"[warn] finetuned ckpt not found: {finetuned_path!r}")
 
@@ -525,13 +553,14 @@ def clear_prompts(frames_state, prompt_frame):
 def run_segmentation(
     frames_state, clicks, prompt_frame, iou_thresh: float,
     config_path: str, weights_path: str, device_name: str, checkpoint: str,
+    variant_choice: str = "auto",
 ):
     print(f"[seg] frames={frames_state is not None}, n_clicks={len(clicks) if clicks else 0}, "
-          f"prompt_frame={prompt_frame}, ckpt={checkpoint!r}")
+          f"prompt_frame={prompt_frame}, ckpt={checkpoint!r}, variant={variant_choice!r}")
     try:
         return _run_segmentation_inner(
             frames_state, clicks, prompt_frame, iou_thresh,
-            config_path, weights_path, device_name, checkpoint,
+            config_path, weights_path, device_name, checkpoint, variant_choice,
         )
     except Exception:
         msg = traceback.format_exc()
@@ -542,6 +571,7 @@ def run_segmentation(
 def _run_segmentation_inner(
     frames_state, clicks, prompt_frame, iou_thresh: float,
     config_path: str, weights_path: str, device_name: str, checkpoint: str,
+    variant_choice: str = "auto",
 ):
     if frames_state is None or not frames_state.get("rgb"):
         return [], None, "Generate frames in Tab 1 first."
@@ -550,11 +580,15 @@ def _run_segmentation_inner(
 
     # A finetuned checkpoint selection of the baseline sentinel means none.
     finetuned = "" if (not checkpoint or checkpoint == _BASELINE_CHOICE) else checkpoint.strip()
-    print(f"[seg] loading model from {weights_path!r} (ckpt={finetuned or 'baseline'}) …")
+    # "auto" infers the variant from the checkpoint's keys; otherwise honour the
+    # explicit choice (lets you force the temporal/memory head if needed).
+    variant = _detect_variant(finetuned) if variant_choice == "auto" else variant_choice
+    print(f"[seg] loading model from {weights_path!r} "
+          f"(ckpt={finetuned or 'baseline'}, variant={variant}) …")
     try:
         backbone, head = _load_seg_model(
             config_path.strip(), weights_path.strip(), device_name.strip(),
-            finetuned_path=finetuned,
+            finetuned_path=finetuned, variant=variant,
         )
     except Exception:
         msg = traceback.format_exc()
@@ -638,7 +672,7 @@ def _run_segmentation_inner(
     model_name = os.path.basename(finetuned) if finetuned else "baseline"
     status = (
         f"Segmented {T_frames} frame(s)  |  {n_clicks} prompt(s) on frame {pf + 1}  |  "
-        f"model: {model_name}  |  IoU threshold: {float(iou_thresh):.2f}"
+        f"model: {model_name} ({variant})  |  IoU threshold: {float(iou_thresh):.2f}"
     )
     print(f"[seg] done — {len(result_frames)} frames rendered")
     return gallery, video_path, status
@@ -735,7 +769,8 @@ def build_demo(
                     "frame and propagates it to the others — so you can prompt any frame, not just "
                     "the first. Paint the object, then **Add Prompt** (repeat for more objects on "
                     "the *same* frame). Selecting a different frame clears prompts.\n\n"
-                    "**Step 3** Click **Segment Video** to run VideoIMaskDINOHead across all frames."
+                    "**Step 3** Pick a checkpoint (the **Model variant** is auto-detected from it) "
+                    "and click **Segment Video** to run the selected video model across all frames."
                 )
                 clicks_state       = gr.State([])
                 prompt_frame_state = gr.State(0)   # which frame the prompt is anchored to
@@ -771,6 +806,12 @@ def build_demo(
                                 scale=5,
                             )
                             refresh_ckpts_btn = gr.Button("⟳", scale=1, min_width=40)
+                        variant_radio = gr.Radio(
+                            choices=["auto", "temporal", "memory"], value="auto",
+                            label="Model variant",
+                            info="auto = infer from checkpoint keys "
+                                 "(temporal_layers→temporal, memory_layers→memory)",
+                        )
                         iou_sl  = gr.Slider(0.0, 1.0, step=0.05, value=0.3,
                                             label="IoU threshold (hides low-confidence masks)")
                         seg_btn = gr.Button("Segment Video", variant="primary")
@@ -825,7 +866,8 @@ def build_demo(
                 seg_btn.click(
                     run_segmentation,
                     inputs=[frames_state, clicks_state, prompt_frame_state, iou_sl,
-                            config_box, weights_box, device_box, checkpoint_dd],
+                            config_box, weights_box, device_box, checkpoint_dd,
+                            variant_radio],
                     outputs=[seg_gallery, seg_video, status_t2],
                 )
 
@@ -856,6 +898,6 @@ if __name__ == "__main__":
 
 """
 python promptable_video_segmentation/gradio_dico_video.py \
-  --ckpt-dir promptable_video_segmentation/output/video_ft/checkpoints
+  --ckpt-dir promptable_video_segmentation/output/video_ft_memory/checkpoints
 
 """

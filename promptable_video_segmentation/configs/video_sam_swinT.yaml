@@ -158,8 +158,11 @@ MODEL:
     # Video-specific settings (new keys; not present in image config)
     # ----------------------------------------------------------------
     NUM_FRAMES: 2        # default clip length; overridable at call time
-    TEMPORAL_NHEAD: 8    # heads in each TemporalSelfAttention layer
+    TEMPORAL_NHEAD: 8    # heads in each TemporalSelfAttention layer (variant=temporal)
     TEMPORAL_DROPOUT: 0.0
+    # Memory-conditioned variant (variant=memory; video_memory_mask_dino.py).
+    MEMORY_NHEAD: 8      # heads in each MaskConditionedMemoryAttention layer
+    MEMORY_DROPOUT: 0.0
 
 INPUT:
   PIXEL_MEAN: [123.675, 116.280, 103.530]

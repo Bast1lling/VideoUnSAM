@@ -92,6 +92,7 @@ class DiCoVideoDataset(Dataset):
         recursive: bool = False,
         require_all_frames: bool = False,
         image_size: int | None = None,
+        max_masks: int | None = None,
     ):
         # Either an explicit list of .npz paths (for custom train/val splits) or
         # a directory to glob (optionally recursively, for nested ImageNet dirs).
@@ -131,6 +132,11 @@ class DiCoVideoDataset(Dataset):
         # prompt frame; it may be partially or fully absent (empty mask) in other
         # frames, so the model learns to emit empty masks where the object left.
         self.require_all_frames = require_all_frames
+        # Cap the mask pool per clip.  Each file holds ~60 (up to ~164) masks, but
+        # only `num_prompts` are ever used downstream, yet every mask is
+        # augmented + resized T times in __getitem__ — the dominant per-item cost.
+        # Subsampling to max_masks bounds that work (None = keep all).
+        self.max_masks = max_masks
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -212,6 +218,13 @@ class DiCoVideoDataset(Dataset):
 
         if masks_all.shape[0] == 0:
             raise RuntimeError(f"No masks remain after type filtering for {image_path}")
+
+        # Cap the pool *before* the expensive per-frame augmentation loop: only a
+        # few of these masks become prompts, so augmenting all ~60 is wasted work.
+        # random.sample uses python's RNG, which DataLoader seeds per worker.
+        if self.max_masks is not None and masks_all.shape[0] > self.max_masks:
+            sel = random.sample(range(masks_all.shape[0]), self.max_masks)
+            masks_all = masks_all[sel]
 
         image_bgr = cv2.imread(image_path)
         if image_bgr is None:
