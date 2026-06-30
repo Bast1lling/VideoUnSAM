@@ -22,6 +22,28 @@ import torch
 import torch.nn.functional as F
 
 
+def _spatial_cost(
+    gh_a: int, gw_a: int, gh_b: int, gw_b: int, device: str
+) -> torch.Tensor:
+    """[N_a, N_b] normalized spatial distance between patch grid positions.
+
+    Coordinates are in [0, 1] per axis; distances are divided by sqrt(2) so the
+    matrix lives in [0, 1].  Adding this to the feature cost with a small weight
+    (e.g. 0.3) prevents transport from jumping to semantically-similar but
+    spatially-distant background regions (bmx-trees, kite-surf).
+    """
+    def _coords(gh: int, gw: int) -> torch.Tensor:
+        ys = torch.arange(gh, device=device).float() / max(gh - 1, 1)
+        xs = torch.arange(gw, device=device).float() / max(gw - 1, 1)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+        return torch.stack([gy.flatten(), gx.flatten()], dim=1)  # [N, 2]
+
+    ca = _coords(gh_a, gw_a)  # [N_a, 2]
+    cb = _coords(gh_b, gw_b)  # [N_b, 2]
+    diff = ca[:, None, :] - cb[None, :, :]  # [N_a, N_b, 2]
+    return diff.norm(dim=-1) / (2 ** 0.5)   # [N_a, N_b] in [0, 1]
+
+
 def _mask_to_patch_indicator(mask_hw: np.ndarray, grid_h: int, grid_w: int) -> torch.Tensor:
     """Downsample binary mask [H,W] → per-patch coverage [grid_h*grid_w] in [0,1]."""
     m = torch.from_numpy(mask_hw.astype(np.float32))[None, None]
@@ -52,14 +74,36 @@ def _sinkhorn_log(cost: torch.Tensor, mu: torch.Tensor, nu: torch.Tensor,
 
 
 def propagate_patch(
-    feats_a: torch.Tensor,   # [gh_a, gw_a, D] L2-normalised
-    feats_b: torch.Tensor,   # [gh_b, gw_b, D] L2-normalised
-    m_a_patch: torch.Tensor, # [N_a] soft indicator in [0,1] (NOT normalised)
+    feats_a: torch.Tensor,    # [gh_a, gw_a, D] L2-normalised
+    feats_b: torch.Tensor,    # [gh_b, gw_b, D] L2-normalised
+    m_a_patch: torch.Tensor,  # [N_a] soft indicator in [0,1] (NOT normalised)
     blur: float = 0.05,
     sinkhorn_iters: int = 200,
     device: str = "cuda",
-) -> torch.Tensor:
-    """Core OT push at patch level. Returns [N_b] soft mass, peak-normalised to 1."""
+    spatial_weight: float = 0.0,
+    motion_a: torch.Tensor | None = None,  # [N_a] per-patch frame-diff score in [0,1]
+    motion_b: torch.Tensor | None = None,  # [N_b] per-patch frame-diff score in [0,1]
+    motion_weight: float = 0.0,
+    cost_addend: torch.Tensor | None = None,  # [N_a, N_b] extra cost to add (e.g. color)
+    point_a: torch.Tensor | None = None,  # [N_a] one-hot click indicator — propagated free
+    cycle_weight: float = 0.0,  # forward-backward consistency reweight strength
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Core OT push at patch level. Returns [N_b] soft mass, peak-normalised to 1.
+
+    spatial_weight > 0 adds a Euclidean patch-position penalty to the cost matrix.
+    motion_weight > 0 adds |motion_b[j] - motion_a[i]| to the cost, which penalises
+    transport between patches with very different frame-to-frame motion magnitudes.
+    cost_addend: arbitrary [N_a, N_b] additive term — caller is responsible for scaling.
+    point_a: if given, propagates a click-point indicator through the same transport plan
+             at zero extra cost and returns (heat, point_b) instead of just heat.
+             point_b argmax gives the tracked click patch index in frame B.
+    cycle_weight > 0: forward-backward (cycle) consistency. For each B patch j, the
+             backward conditional P(a|j) = T_aj / ν_j says where j's mass came from in A.
+             s_j = Σ_a m_a · P(a|j) is the fraction that traces back into the source mask.
+             heat is multiplied by s_j ** cycle_weight, suppressing patches whose mass
+             does NOT round-trip to the seed (identity switches, adjacent-background leak).
+             At weight 0 the multiplier s**0 = 1 → no effect. Reuses T, near-zero cost.
+    """
     gh_a, gw_a, D = feats_a.shape
     gh_b, gw_b, _ = feats_b.shape
     N_a, N_b = gh_a * gw_a, gh_b * gw_b
@@ -70,11 +114,112 @@ def propagate_patch(
     nu = torch.full((N_b,), 1.0 / N_b, device=device)
 
     cost = 1.0 - fa @ fb.T
+    if spatial_weight > 0.0:
+        cost = cost + spatial_weight * _spatial_cost(gh_a, gw_a, gh_b, gw_b, device)
+    if motion_weight > 0.0 and motion_a is not None and motion_b is not None:
+        ma = motion_a.to(device).float()   # [N_a]
+        mb = motion_b.to(device).float()   # [N_b]
+        cost = cost + motion_weight * (mb[None, :] - ma[:, None]).abs()  # [N_a, N_b]
+    if cost_addend is not None:
+        cost = cost + cost_addend.to(device).float()
     eps = blur ** 2
     T = _sinkhorn_log(cost, mu, nu, eps=eps, n_iter=sinkhorn_iters)
-    cond = T / mu[:, None]  # rows sum to 1
-    m_b = m_a_patch.to(device) @ cond  # [N_b]
-    return m_b / (m_b.max() + 1e-8)
+    cond = T / mu[:, None]  # rows sum to 1  → P(b|a)
+    m_a_dev = m_a_patch.to(device)
+    m_b = m_a_dev @ cond  # [N_b]
+
+    if cycle_weight > 0.0:
+        # Backward conditional P(a|b) = T_ab / ν_b; columns sum to 1 over a.
+        cond_back = T / nu[None, :]
+        s = m_a_dev @ cond_back  # [N_b] round-trip mass into the seed
+        # Reference level = the object's OWN round-trip score, weighted by forward mass.
+        # Normalising by the global max instead would peak-sharpen (both s and m_b peak at
+        # the seed centre) and collapse the mask. Gate relative to the object's level so
+        # body patches keep full heat (gate→1) and only sub-object leaks are suppressed.
+        w = m_b / (m_b.sum() + 1e-8)
+        s_ref = (w * s).sum()
+        gate = (s / (s_ref + 1e-8)).clamp(max=1.0)
+        m_b = m_b * gate.pow(cycle_weight)
+
+    heat = m_b / (m_b.max() + 1e-8)
+
+    if point_a is not None:
+        point_b = point_a.to(device).float() @ cond  # [N_b] — same plan, free ride
+        return heat, point_b
+    return heat
+
+
+def propagate_multiscale(
+    feats_a: torch.Tensor,   # [gh, gw, D] L2-normalised (fine scale, e.g. 64×64)
+    feats_b: torch.Tensor,   # [gh, gw, D] L2-normalised
+    m_a_patch: torch.Tensor, # [N_a] soft indicator at fine scale
+    blur_fine: float = 0.05,
+    blur_coarse: float = 0.10,
+    coarse_factor: int = 4,  # pool 64→16 patches
+    alpha: float = 0.4,      # weight given to coarse heatmap
+    sinkhorn_iters: int = 200,
+    device: str = "cuda",
+    spatial_weight: float = 0.0,
+    motion_a: torch.Tensor | None = None,
+    motion_b: torch.Tensor | None = None,
+    motion_weight: float = 0.0,
+) -> torch.Tensor:
+    """Multi-scale OT: run at fine (64×64) and coarse (16×16) grids, blend results.
+
+    The coarse pass uses a larger blur and larger effective patch size, so it
+    can track objects that move more than ~2 patches between frames (fast motion,
+    small objects). The fine pass keeps localisation accuracy.
+
+    Returns [N_b] combined heatmap, peak-normalised to 1.
+    """
+    gh, gw, D = feats_a.shape
+
+    # Fine-scale OT (existing behaviour)
+    heat_fine = propagate_patch(feats_a, feats_b, m_a_patch,
+                                blur=blur_fine, sinkhorn_iters=sinkhorn_iters, device=device,
+                                spatial_weight=spatial_weight,
+                                motion_a=motion_a, motion_b=motion_b, motion_weight=motion_weight)
+
+    # Coarse features: average-pool D-dim features spatially then re-normalise
+    gc = gh // coarse_factor
+    fa_c = F.avg_pool2d(feats_a.permute(2, 0, 1).unsqueeze(0).float(),
+                        coarse_factor)[0].permute(1, 2, 0)  # [gc, gc, D]
+    fb_c = F.avg_pool2d(feats_b.permute(2, 0, 1).unsqueeze(0).float(),
+                        coarse_factor)[0].permute(1, 2, 0)
+    fa_c = F.normalize(fa_c, dim=-1)
+    fb_c = F.normalize(fb_c, dim=-1)
+
+    # Coarse mask: pool the fine indicator then re-normalise to [0, 1]
+    m_c = F.avg_pool2d(
+        m_a_patch.reshape(1, 1, gh, gw).float(), coarse_factor
+    )[0, 0].flatten()
+    if m_c.max() > 0:
+        m_c = m_c / m_c.max()
+    else:
+        return heat_fine  # nothing to track
+
+    # Pool motion vectors to coarse grid
+    ma_c = mb_c = None
+    if motion_weight > 0.0 and motion_a is not None and motion_b is not None:
+        ma_c = F.avg_pool2d(motion_a.reshape(1, 1, gh, gw).float(),
+                            coarse_factor)[0, 0].flatten()
+        mb_c = F.avg_pool2d(motion_b.reshape(1, 1, gh, gw).float(),
+                            coarse_factor)[0, 0].flatten()
+
+    # Coarse OT
+    heat_coarse = propagate_patch(fa_c, fb_c, m_c,
+                                  blur=blur_coarse, sinkhorn_iters=sinkhorn_iters, device=device,
+                                  spatial_weight=spatial_weight,
+                                  motion_a=ma_c, motion_b=mb_c, motion_weight=motion_weight)
+
+    # Upsample coarse heatmap to fine-scale grid
+    heat_coarse_up = F.interpolate(
+        heat_coarse.reshape(1, 1, gc, gc).float(),
+        size=(gh, gw), mode="bilinear", align_corners=False
+    )[0, 0].flatten()
+
+    combined = (1.0 - alpha) * heat_fine + alpha * heat_coarse_up
+    return combined / (combined.max() + 1e-8)
 
 
 def propagate(

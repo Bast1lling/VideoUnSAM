@@ -30,10 +30,43 @@ sys.path.insert(0, str(_REPO))
 sys.path.insert(0, str(_REPO / "divide_and_conquer"))
 from video.features.dinov3_dense import DenseDINOv3  # noqa: E402
 from video.loaders import davis  # noqa: E402
-from video.decoder.train_sam_decoder import sample_clicks, _IMG  # noqa: E402
+from video.decoder.train_sam_decoder import sample_clicks  # noqa: E402
 from video.divide.cuvler_divide import CuVLERDivider  # noqa: E402
 from video.divide.conquer import load_backbone, run_conquer  # noqa: E402
 from video.propagation.sinkhorn_ot import propagate_patch, _mask_to_patch_indicator  # noqa: E402
+
+
+def _color_cost_patches(frame_a: np.ndarray, frame_b: np.ndarray,
+                        gh_a: int, gw_a: int, gh_b: int, gw_b: int,
+                        weight: float = 0.2) -> torch.Tensor:
+    """Per-patch LAB color distance [N_a, N_b], scaled by weight.
+
+    Pools each frame to the DINOv3 patch grid, converts to LAB, then computes
+    L2 distance between every pair of source/target patches.  Adding this to the
+    Sinkhorn cost penalises transport between patches with different mean colors,
+    which helps separate visually similar but differently-coloured objects (e.g.
+    dancers in different-coloured costumes).
+    """
+    fa_lab = cv2.cvtColor(frame_a, cv2.COLOR_RGB2LAB).astype(np.float32) / 255.0
+    fb_lab = cv2.cvtColor(frame_b, cv2.COLOR_RGB2LAB).astype(np.float32) / 255.0
+    fa_t = torch.from_numpy(fa_lab.transpose(2, 0, 1)).unsqueeze(0)
+    fb_t = torch.from_numpy(fb_lab.transpose(2, 0, 1)).unsqueeze(0)
+    fa_pool = F.adaptive_avg_pool2d(fa_t, (gh_a, gw_a))[0].permute(1, 2, 0).reshape(-1, 3)
+    fb_pool = F.adaptive_avg_pool2d(fb_t, (gh_b, gw_b))[0].permute(1, 2, 0).reshape(-1, 3)
+    diff = fa_pool[:, None, :] - fb_pool[None, :, :]   # [N_a, N_b, 3]
+    dist = diff.norm(dim=-1)                             # [N_a, N_b]
+    dist = dist / (dist.max() + 1e-8)                   # normalise to [0, 1]
+    return weight * dist
+
+
+def _frame_diff_patches(frame_a: np.ndarray, frame_b: np.ndarray,
+                         gh: int = 64, gw: int = 64) -> torch.Tensor:
+    """Mean absolute pixel diff between two RGB frames, pooled to [gh*gw] in [0,1]."""
+    diff = np.abs(frame_b.astype(np.float32) - frame_a.astype(np.float32)).mean(axis=-1)
+    pooled = F.adaptive_avg_pool2d(
+        torch.from_numpy(diff)[None, None], (gh, gw)
+    )[0, 0]
+    return (pooled / (pooled.max() + 1e-8)).flatten()
 
 
 def refine_mask(refiner, frame_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -163,7 +196,17 @@ def main():
                     help="Re-run CuVLER every N frames (0 = never, baseline OT chain)")
     ap.add_argument("--reseed-thresh", type=float, default=0.3,
                     help="Min IoU between CuVLER proposal and current OT mask to accept re-seed")
+    ap.add_argument("--feat-size", type=int, default=1024,
+                    help="Image size fed to DINOv3 (default 1024 → 64×64 grid; "
+                         "2048 → 128×128 grid, ~8× slower but sharper boundaries).")
     ap.add_argument("--blur", type=float, default=0.05)
+    ap.add_argument("--spatial-weight", type=float, default=0.0,
+                    help="Spatial prior weight λ added to OT cost: C_ij += λ·||pos_i-pos_j||/√2. "
+                         "Prevents tracking from jumping to distant background (try 0.3).")
+    ap.add_argument("--motion-weight", type=float, default=0.0,
+                    help="Motion consistency weight γ: C_ij += γ·|fd_b[j]-fd_a[i]|. "
+                         "Penalises transport between patches with mismatched frame-diff "
+                         "magnitude. Near-zero cost on slow clips (try 0.5).")
     ap.add_argument("--thresh", type=float, default=0.5)
     ap.add_argument("--max-frames", type=int, default=0, help="0 = whole clip")
     ap.add_argument("--fps", type=int, default=8)
@@ -181,6 +224,21 @@ def main():
     ap.add_argument("--conquer", action="store_true",
                     help="Run DINOv3 spectral conquer stage within each CuVLER proposal bbox "
                          "to generate tighter sub-masks before proposal selection.")
+    ap.add_argument("--color-weight", type=float, default=0.0,
+                    help="Weight for per-patch LAB color distance added to OT cost: "
+                         "cost += w * L2(LAB_a, LAB_b).  Separates objects with different "
+                         "colours that share DINOv3 features (try 0.2).")
+    ap.add_argument("--cycle-weight", type=float, default=0.0,
+                    help="Forward-backward consistency reweight. Each frame-B patch's heat "
+                         "is multiplied by (round-trip mass into seed) ** cycle_weight, "
+                         "suppressing mass that does not map back to the source mask "
+                         "(identity switches, adjacent-background leak). Reuses the OT plan, "
+                         "near-zero cost. Try 1.0; higher = stricter (2.0).")
+    ap.add_argument("--template-alpha", type=float, default=0.0,
+                    help="Blend weight for appearance-template heat. At each frame, per-patch "
+                         "cosine similarity to the frame-0 seed features is blended into the OT "
+                         "heat: heat = (1-α)·OT + α·template_sim. Helps multi-object scenes "
+                         "where similar-looking distractors cause OT drift (try 0.3).")
     args = ap.parse_args()
 
     dino = DenseDINOv3()
@@ -239,12 +297,34 @@ def main():
     seed_iou = iou(gt0, seed)
     print(f"  frame 0: {len(proposals0)} proposals -> seed IoU={seed_iou:.3f}")
 
-    img1024 = cv2.resize(frame0, (_IMG, _IMG))
-    feats_prev = dino.extract(img1024, normalize=False)["feats"].cuda().float()
+    img_sized = cv2.resize(frame0, (args.feat_size, args.feat_size))
+    feats_prev = dino.extract(img_sized, normalize=False)["feats"].cuda().float()
     feats_prev_norm = F.normalize(feats_prev, dim=-1)
+    gh_feat, gw_feat = feats_prev_norm.shape[:2]  # 64 at 1024px, 128 at 2048px
 
     cur_mask = seed.astype(np.uint8)
-    patch = mask_to_patch(cur_mask)
+    patch = mask_to_patch(cur_mask, gh=gh_feat, gw=gw_feat)
+    frame_prev = frame0
+    fd_a = None  # no prior-frame diff at t=0
+
+    # Click-point tracker: one-hot indicator at the click patch, propagated free
+    # through the same Sinkhorn plan as the mask on every frame.
+    cx_feat = int(round(click_xy[0] * gw_feat / W))
+    cy_feat = int(round(click_xy[1] * gh_feat / H))
+    cx_feat = max(0, min(gw_feat - 1, cx_feat))
+    cy_feat = max(0, min(gh_feat - 1, cy_feat))
+    click_ind = torch.zeros(gh_feat * gw_feat)
+    click_ind[cy_feat * gw_feat + cx_feat] = 1.0
+
+    # Build appearance template from frame-0 seed (for --template-alpha)
+    template_feat = None
+    if args.template_alpha > 0.0:
+        seed_ind = patch.to("cuda")  # [N] in [0, 1]
+        feats_flat = feats_prev_norm.reshape(-1, feats_prev_norm.shape[-1]).cuda()
+        if seed_ind.sum() > 0:
+            template_feat = F.normalize(
+                (seed_ind[:, None] * feats_flat).sum(0), dim=0
+            )  # [D]
 
     # Refine frame-0 seed for display (OT propagation still uses cur_mask/patch)
     display_mask0 = refine_mask(refiner, frame0, cur_mask) if refiner else cur_mask
@@ -276,14 +356,43 @@ def main():
         frame = davis.load_frame(args.clip, fidx)
         gt = davis.load_mask(args.clip, fidx, instance_id=args.instance_id)
 
-        img1024 = cv2.resize(frame, (_IMG, _IMG))
-        feats_cur = dino.extract(img1024, normalize=False)["feats"].cuda().float()
+        img_sized = cv2.resize(frame, (args.feat_size, args.feat_size))
+        feats_cur = dino.extract(img_sized, normalize=False)["feats"].cuda().float()
         feats_cur_norm = F.normalize(feats_cur, dim=-1)
+        gh_cur, gw_cur = feats_cur_norm.shape[:2]
 
-        # OT propagation from previous patch distribution
-        heat = propagate_patch(feats_prev_norm, feats_cur_norm, patch, blur=args.blur)
+        fd_b = _frame_diff_patches(frame_prev, frame, gh=gh_feat, gw=gw_feat) if args.motion_weight > 0 else None
+
+        color_cost = None
+        if args.color_weight > 0.0:
+            color_cost = _color_cost_patches(
+                frame_prev, frame, gh_feat, gw_feat, gh_cur, gw_cur, weight=args.color_weight
+            )
+
+        # OT propagation — mask + click indicator share the same transport plan
+        heat, click_ind = propagate_patch(
+            feats_prev_norm, feats_cur_norm, patch, blur=args.blur,
+            spatial_weight=args.spatial_weight,
+            motion_a=fd_a, motion_b=fd_b, motion_weight=args.motion_weight,
+            cost_addend=color_cost,
+            point_a=click_ind,
+            cycle_weight=args.cycle_weight,
+        )
+        tracked_idx = int(click_ind.argmax().item())
+        tracked_x = (tracked_idx % gw_cur) * W / gw_cur
+        tracked_y = (tracked_idx // gw_cur) * H / gh_cur
+
+        # Blend with appearance template if requested
+        if template_feat is not None and args.template_alpha > 0.0:
+            feats_cur_flat = feats_cur_norm.reshape(-1, feats_cur_norm.shape[-1]).cuda()
+            templ_sim = (feats_cur_flat @ template_feat).clamp(min=0)  # [N_b] in [0,1]
+            templ_sim = templ_sim / (templ_sim.max() + 1e-8)
+            heat = ((1.0 - args.template_alpha) * heat.cuda()
+                    + args.template_alpha * templ_sim)
+            heat = heat / (heat.max() + 1e-8)
+
         heat_up = F.interpolate(
-            heat.reshape(1, 1, 64, 64), size=(H, W), mode="bilinear", align_corners=False
+            heat.reshape(1, 1, gh_cur, gw_cur), size=(H, W), mode="bilinear", align_corners=False
         )[0, 0].cpu().numpy()
         ot_mask = (heat_up > args.thresh * heat_up.max()).astype(np.uint8)
 
@@ -301,22 +410,22 @@ def main():
                 overlap = iou(ot_mask, candidate)
                 if overlap >= args.reseed_thresh:
                     cur_mask = candidate
-                    patch = mask_to_patch(cur_mask)
+                    patch = mask_to_patch(cur_mask, gh=gh_feat, gw=gw_feat)
                     did_reseed = True
                     print(f"  frame {fidx:3d}: RESEED  overlap={overlap:.3f}  "
                           f"({len(proposals)} proposals)")
                 else:
                     cur_mask = ot_mask
-                    patch = heat
+                    patch = mask_to_patch(ot_mask, gh=gh_feat, gw=gw_feat)
                     print(f"  frame {fidx:3d}: reseed rejected (overlap={overlap:.3f} < "
                           f"{args.reseed_thresh})  keeping OT")
             else:
                 cur_mask = ot_mask
-                patch = heat
+                patch = mask_to_patch(ot_mask, gh=gh_feat, gw=gw_feat)
                 print(f"  frame {fidx:3d}: no proposals, keeping OT")
         else:
             cur_mask = ot_mask
-            patch = heat
+            patch = mask_to_patch(ot_mask, gh=gh_feat, gw=gw_feat)
 
         score_raw = iou(gt, cur_mask) if gt.sum() > 0 else float("nan")
         ious_raw.append(score_raw)
@@ -340,6 +449,8 @@ def main():
         writer.write(cv2.cvtColor(np.concatenate(panels, axis=1), cv2.COLOR_RGB2BGR))
 
         feats_prev_norm = feats_cur_norm
+        frame_prev = frame
+        fd_a = fd_b
         if not did_reseed:
             ref_str = f"  refined={score_ref:.3f}" if refiner else ""
             print(f"  frame {fidx:3d}: IoU={score_raw:.3f}{ref_str}")

@@ -19,61 +19,256 @@ Unsupervised SAM (UnSAM) is a "segment anything" model for promptable and automa
 
 ## VideoUnSAM Extension
 
-Extending UnSAM into the temporal domain with DINOv3 features and Sinkhorn
-optimal-transport mask propagation. See `video/` for the new code.
+Extending UnSAM into the temporal domain. A user clicks once on frame 0; the
+system segments the object across every frame of the clip. **No labels, no
+fine-tuning, no supervised components** — fully annotation-free at every stage.
 
-### Phase 1 — Static divide-and-conquer (DINOv3)
+### Pipeline
 
-CutLER divide → DINOv3 ViT-L/16 conquer on a single image.
-
-```bash
-# End-to-end on the demo image (writes a colored mask overlay)
-.venv/bin/python divide_and_conquer/demo_dico.py \
-  --backbone dinov3 --output pseudo_masks_output.png
-
-# Divide → conquer → synthetic stills video (UnSAM v1-style augmented "video")
-.venv/bin/python divide_and_conquer/divide_conquer_videoV3.py \
-  --input docs/demos/sa_234337.jpg \
-  --output-video output.mp4 --output-preview preview.png
+```
+Frame 0 (user click)
+        │
+        ▼
+┌─────────────────────┐
+│  1. DIVIDE          │  CuVLER — class-agnostic region proposals
+│  video/divide/      │  (trained on MaskCut pseudo-masks, no human labels)
+└────────┬────────────┘
+         ▼
+┌─────────────────────┐
+│  2. CONQUER         │  DINOv3 spectral merging within each CuVLER bbox
+│  video/divide/      │  expands 1 coarse proposal → 30+ tight sub-masks
+│  conquer.py         │  critical for crowded scenes (breakdance: 0.14→0.73)
+└────────┬────────────┘
+         ▼
+┌─────────────────────┐
+│  3. OT PROPAGATION  │  Sinkhorn optimal-transport on DINOv3 patch features
+│  video/propagation/ │  chains frame-to-frame, drift ~0.10 IoU / 30 frames
+└────────┬────────────┘
+         │  every 10 frames
+         ▼
+┌─────────────────────┐
+│  4. PERIODIC RESEED │  Re-run CuVLER+conquer; accept if IoU overlap ≥ 0.3
+│  video/scripts/     │  corrects drift, shown in orange in output video
+└────────┬────────────┘
+         │  optional
+         ▼
+┌─────────────────────┐
+│  5. DENSE CRF       │  Fully-connected CRF with DINOv3 bilateral kernel
+│  video/refine/      │  sharpens boundaries, applied only when heatmap is
+│  dense_crf.py       │  confident (top-10% mean ≥ 0.65) — pure algorithm
+└─────────────────────┘
 ```
 
-### Phase 2 — Real-video propagation on DAVIS 2017
+### Results — DAVIS 2016 val (20 clips, fully annotation-free)
 
-DAVIS is expected at `datasets/davis/DAVIS/{JPEGImages,Annotations}/480p/<clip>/`.
+**Ablation** (adding each component):
 
-```bash
-# Sanity: DINOv3 patch-cosine map between two frames of a clip.
-# Pick a query patch in frame A; heatmap shows where DINOv3 thinks it went in B.
-.venv/bin/python -m video.scripts.visualize_frame_similarity \
-  --clip blackswan --frame-a 0 --frame-b 20 \
-  --query-xy 0.45 0.7 --out sim_blackswan.png
+| Configuration | J mean | F mean | J&F |
+|---|---|---|---|
+| No reseed | 0.592 | 0.496 | 0.544 |
+| + Periodic reseed | 0.621 | 0.523 | 0.572 |
+| + Selective Dense CRF | **0.635** | **0.571** | **0.603** |
 
-# Single-hop OT mask propagation A → B.
-# Uses DAVIS GT at frame A as the source mask (stand-in for a Phase-1 pseudo-mask).
-# --upscale 2.0 doubles the DINOv3 feature grid for sharper boundaries.
-.venv/bin/python -m video.scripts.propagate_mask \
-  --clip blackswan --frame-a 0 --frame-b 20 --instance-id 1 \
-  --upscale 2.0 --out prop_blackswan.png
+**Per-clip breakdown** (full pipeline, J&F):
 
-# Same, but also runs SAM ViT-H as a *diagnostic* boundary refiner on the OT
-# output. Reports both OT and SAM IoU. NOT used in the pseudo-mask pipeline
-# downstream — SAM imports a supervised prior; we keep this here only to
-# visualise an "ideal refinement" ceiling. Requires the SAM checkpoint at
-# checkpoints/sam_vit_h_4b8939.pth.
-.venv/bin/python -m video.scripts.propagate_mask \
-  --clip bmx-trees --frame-a 0 --frame-b 15 --instance-id 1 \
-  --upscale 2.0 --sam --out bmx_sam.png
+| Clip | J | F | J&F | Notes |
+|---|---|---|---|---|
+| blackswan | 0.925 | 0.933 | 0.929 | |
+| bmx-trees | 0.077 | 0.183 | 0.130 | trees occlude rider, OT latches onto background |
+| breakdance | 0.782 | 0.669 | 0.725 | crowd-bleed at seed; conquer sub-masks critical; 0.791 at 2048px |
+| camel | 0.807 | 0.713 | 0.760 | |
+| car-roundabout | 0.875 | 0.640 | 0.758 | |
+| car-shadow | 0.817 | 0.595 | 0.706 | |
+| cows | 0.865 | 0.722 | 0.794 | |
+| dance-twirl | 0.817 | 0.718 | 0.768 | |
+| dog | 0.897 | 0.747 | 0.822 | |
+| drift-chicane | 0.000 | 0.003 | 0.001 | car < 1 patch at 64×64 grid; sub-patch object |
+| drift-straight | 0.720 | 0.518 | 0.619 | |
+| goat | 0.852 | 0.736 | 0.794 | |
+| horsejump-high | 0.622 | 0.569 | 0.595 | |
+| kite-surf | 0.134 | 0.286 | 0.210 | small kite frequently lost |
+| libby | 0.470 | 0.474 | 0.472 | |
+| motocross-jump | 0.567 | 0.551 | 0.559 | |
+| paragliding-launch | 0.754 | 0.710 | 0.732 | |
+| parkour | 0.833 | 0.808 | 0.820 | |
+| scooter-black | 0.350 | 0.449 | 0.399 | low contrast against dark background |
+| soapbox | 0.529 | 0.405 | 0.467 | |
 
-# Chained-hop OT propagation: small strides with soft patch-level mass passed
-# through every hop (no mid-chain binarisation). Helps slightly on long
-# easy/medium clips, collapses on multi-instance hard clips (dogs-jump) —
-# that failure motivates the Phase-3 KV memory.
-.venv/bin/python -m video.scripts.propagate_chain \
-  --clip blackswan --frame-a 0 --frame-b 45 --stride 5 \
-  --instance-id 1 --upscale 2.0 --out chain_blackswan.png
+**Known failure modes:**
+- *Sub-patch objects* (drift-chicane): at the default 64×64 grid (16 px/patch), objects smaller than ~2 patches score near zero. The 128×128 grid (`--feat-size 2048`, 8 px/patch) partially addresses this but drift-chicane's car is still sub-patch even at that resolution.
+- *Background confusion* (bmx-trees): OT can lock onto background textures (tree branches) that are semantically similar to the foreground object. Periodic reseed only recovers if the drifted mask still overlaps the correct object.
+- *Low-contrast objects* (scooter-black, kite-surf): DINOv3 features distinguish these objects from their backgrounds less reliably, leading to diffuse heatmaps and early tracking loss.
+
+---
+
+### Extended ablations & development log
+
+#### 128×128 feature grid (`--feat-size 2048`)
+
+Increasing the DINOv3 input from 1024→2048 px doubles the patch grid from 64×64 to 128×128 (patch size stays 16 px). Confirmed on breakdance:
+
+| Grid | J | F | J&F |
+|---|---|---|---|
+| 64×64 (1024 px, default) | 0.782 | 0.669 | 0.725 |
+| 128×128 (2048 px) | 0.811 | 0.771 | **0.791** |
+
+F score improvement (+0.102) is the main gain. At 64×64, mask boundaries snap to a 16 px grid on 480p frames, producing blocky stepped edges that destroy F score. At 128×128, each patch is 8 px so boundaries follow the object silhouette twice as finely. J also improves (+0.029) because OT matching itself is more precise at higher resolution. Cost: ~8× slower per clip. Available via `--feat-size 2048` and as a toggle in the Gradio demo.
+
+Clips most likely to benefit: those with large J–F gaps (boundary is the bottleneck) — car-roundabout (gap 0.234), car-shadow (0.223), drift-straight (0.203), dog (0.150).
+
+#### Spatial prior on OT cost matrix
+
+Added `--spatial-weight λ` which injects a normalised Euclidean patch-position penalty into the Sinkhorn cost:
+
+```
+C_ij += λ · ||pos_i − pos_j||_2 / √2
 ```
 
-#### One-time setup for Phase 2
+Hypothesis: prevents OT from jumping to semantically similar but spatially distant background patches. Tested at λ=0.3 and λ=1.0 on the two worst-performing clips:
+
+| Clip | λ=0 | λ=0.3 | λ=1.0 |
+|---|---|---|---|
+| bmx-trees J&F | 0.130 | 0.130 | 0.132 |
+| kite-surf J&F | 0.210 | 0.204 | 0.197 |
+
+**Result: no effect.** Root cause: for bmx-trees the confusing tree-bark patches are *adjacent* (1–2 patches away) to the rider, not distant — so spatial distance cannot separate them. For kite-surf the kite moves fast enough that constraining spatial jumps slightly hurts. Spatial prior is kept in the codebase at default 0.0.
+
+#### Motion consistency prior on OT cost matrix
+
+Added `--motion-weight γ` which adds a per-patch frame-difference penalty:
+
+```
+C_ij += γ · |fd_b[j] − fd_a[i]|
+```
+
+where `fd` is mean absolute pixel change between consecutive frames, pooled to patch level. Hypothesis: object moves differently from static background — penalise transport between patches with mismatched motion magnitudes. On slow clips, both object and background fd are near-zero so the term cancels out and the prior is approximately free.
+
+Full 20-clip eval at γ=0.5:
+
+| | γ=0 | γ=0.5 | Δ |
+|---|---|---|---|
+| J mean | 0.635 | 0.634 | −0.001 |
+| F mean | 0.571 | 0.571 | 0.000 |
+| J&F | 0.603 | 0.603 | 0.000 |
+
+**Result: net zero.** Goat improved +0.017 (animal moves relative to static grass), but breakdance was unchanged (the crowd is also dancing — same motion magnitude as the target) and kite-surf regressed −0.020. Clip-level gains and losses cancel. Prior kept at default 0.0.
+
+#### Reseed threshold tuning (breakdance)
+
+Tested `--reseed-thresh` 0.3 / 0.5 / 0.6 on breakdance. All three give identical J&F=0.725. **Conclusion:** the reseed threshold is not the bottleneck for breakdance. Drift accumulates in the frame-to-frame OT step, not at keyframe reseeds. Raising the threshold does not change which reseeds are accepted (they all overlap the OT mask well).
+
+#### Breakdance frame-0 seed quality (CuVLER vs. CuVLER + conquer)
+
+| | Proposals | IoU vs GT | Mask area |
+|---|---|---|---|
+| CuVLER only | 1 | 0.134 | 60.8% of frame |
+| + Conquer | 32 | **0.744** | 10.8% (GT = 10.0%) |
+
+Without conquer, CuVLER generates one large proposal covering 60% of the frame — the entire crowd. Conquer's DINOv3 spectral clustering within each proposal bbox expands this into 32 tight sub-masks; the best one achieves 0.744 IoU against GT and covers only the target dancer. This is the mechanism behind the 0.14→0.725 J&F jump shown in the main ablation table. The mean J over 84 frames (0.782) exceeds the frame-0 seed IoU (0.744) because periodic reseeds find improved proposals at later keyframes.
+
+#### Dancing clip — multi-instance crowd analysis (DAVIS 2017)
+
+The `dancing` clip from DAVIS 2017 contains **3 simultaneous dancers** sharing overlapping screen regions. It is a hard test for single-object OT propagation because the target dancer physically merges with the other two between frames 41–61.
+
+**Seed quality progression** (all runs: user click on dancer 1, frame 0)
+
+| Configuration | Proposals | Seed IoU | Mean IoU | Median IoU |
+|---|---|---|---|---|
+| Baseline (CuVLER, no conquer) | 1 | 0.049 | 0.035 | — |
+| + Conquer | ~38 | 0.518 | 0.387 | 0.499 |
+| + Crop-context reseed (1.5×) | ~60 | 0.669 | 0.401 | 0.529 |
+| + LAB color fusion (w=0.2) | ~60 | 0.669 | **0.412** | **0.537** |
+
+Color fusion helps frames 1–40 (+0.04–0.05 IoU/frame): the dancers' clothing differs in LAB space, so the additive cost discourages OT from crossing color boundaries. Frames 41–61 are unaffected — when dancers physically overlap, no cost term prevents identity switch.
+
+**Regression check** on benchmark clips with color weight 0.2: blackswan −0.004, camel −0.001. Effectively neutral.
+
+**Frame-0 seed selection fix**
+
+The demo's `max(proposals, key=area)` heuristic was selecting a blob covering 73% of the frame (IoU=0.046) rather than the tight dancer-specific sub-mask (IoU=0.518). CuVLER + conquer generates the correct mask; it just isn't the largest. Fix: if the largest containing-click proposal exceeds **40% of frame area**, assume it is a merged blob and pick the **smallest** proposal instead (minimum 0.5% area floor):
+
+```python
+if largest0.sum() > H * W * 0.40:
+    valid0 = [m for m in containing0 if m.sum() >= H * W * 0.005]
+    seed = min(valid0, key=lambda m: m.sum()) if valid0 else largest0
+else:
+    seed = largest0
+```
+
+**Approaches tested on dancing — rejected**
+
+*Template blending* (α=0.3, 0.5): blend the mean DINOv3 feature of seed patches into OT heat as a persistent appearance prior. Mean IoU crashed from 0.401 to 0.099–0.102. Root cause: all 3 dancers share similar DINOv3 body-part features; the template heat spreads uniformly across all of them and pulls OT mass toward the wrong dancer.
+
+*Click-point tracker as reseed gate*: the Sinkhorn transport plan T already computed for mask propagation can propagate a one-hot click indicator at zero extra cost via `point_b = point_a @ (T/μ)`. The tracked click was used as a hard gate — only accept a reseed proposal if it contains the tracked point. Mean IoU dropped from 0.412 to 0.391. Root cause: the click indicator travels through the same confused OT plan that triggered the identity switch; by frame 50 it had jumped to x=747 (dancer 2), causing all correct reseeds to be rejected. The `point_a` parameter remains in `propagate_patch` for future experimentation, but the hard gate is reverted.
+
+**Fundamental ceiling — frames 41–61**
+
+Dancer 2 rushes from x=772 to x=545 over frames 40–50, physically overlapping dancer 1 (x=539→439). DINOv3 features for the two overlapping bodies become indistinguishable and OT mass switches identity. Per-frame IoU over the collapse: 0.499 → 0.481 → 0.388 → 0.225 → 0.157 → 0.076 → 0.049 → 0.027 → 0.017 → 0.000 over 9 frames. No single-object propagation system can recover without multi-object tracking or re-annotation.
+
+Best achievable unsupervised with a single click: **mean IoU 0.412 / median 0.537** — an 11.8× improvement over the 0.035 baseline.
+
+---
+
+#### Demo improvements (June 2026)
+
+| Feature | Description |
+|---|---|
+| Clip preview video | Compiles DAVIS frames to a looping H.264 MP4 and plays it before the user clicks |
+| Adaptive seed selection | 40% frame-area threshold distinguishes tight sub-masks from merged blobs at frame 0 |
+| Crop-context reseed | At every reseed frame, also runs CuVLER on a 1.5× expanded crop around the OT mask bbox and merges with full-frame proposals |
+| LAB color fusion | `OT_COLOR_WEIGHT=0.2` adds per-patch L² distance in LAB color space to the Sinkhorn cost matrix (`cost_addend` parameter) |
+| Re-binarized patch carry-forward | Between frames the OT mask is re-binarized via `mask_to_patch` before being passed forward, preventing soft-heat mass accumulation over long clips |
+
+---
+
+#### What did not move the needle
+
+| Approach | Tested | Outcome |
+|---|---|---|
+| Spatial OT prior | λ=0.3, 1.0 on bmx-trees, kite-surf | No effect — confuser is spatially adjacent |
+| Motion OT prior | γ=0.5 on all 20 clips | Net zero — crowd co-moves with target |
+| Reseed threshold | 0.3 / 0.5 / 0.6 on breakdance | Identical result — drift is in OT, not reseed |
+| Multi-scale OT | coarse+fine blend | No recovery for sub-patch objects |
+| Higher blur (ε) | blur=0.10 on fast clips | Smears heatmap, does not recover |
+| Template blending | α=0.3, 0.5 on dancing | IoU 0.401→0.099 — DINOv3 body features non-discriminative across dancers |
+| Click-point tracker (reseed gate) | dancing, hard gate on point | IoU 0.412→0.391 — click inherits same OT confusion; hard gate reverted |
+| Forward-backward cycle consistency | dancing, blackswan; weight 1/2/4 | Erodes mask globally, not just leaks — blackswan 0.856→0.717, dancing 0.405→0.071 |
+
+#### Forward-backward cycle consistency (rejected)
+
+Idea: reuse the Sinkhorn plan `T` to check whether mass pushed into frame B traces back to the source mask. For each B patch `j`, the backward conditional `P(a|j) = T_aj / ν_j` says where its mass came from; `s_j = Σ_a m_a · P(a|j)` is the fraction returning to the seed. Multiply heat by `s_j` to suppress identity-switch and adjacent-background leakage. Near-zero cost (`cycle_weight` parameter in `propagate_patch`).
+
+Two normalisations tested — global-max and object-relative gate. **Both regress everywhere.** The failure is fundamental to entropic OT with a small source: the backward conditional `P(a|·)` is broadly diffuse, so the mass returning to the seed's *few* patches is tiny and noisy for **all** B patches — including genuine object-body patches. The gate therefore erodes the whole mask rather than surgically removing leaks. Erosion scales with how small/diffuse the source is: mild on blackswan (large object, 0.856→0.717), catastrophic on dancing (small object, 0.405→0.071, mask collapses to a core). Kept in the code at default `cycle_weight=0.0` (inert).
+
+### Quickstart
+
+```bash
+# Interactive Gradio demo — select a clip, click the object, watch it propagate
+python demo.py
+python demo.py --share   # public link
+
+# Single clip with video output
+python -m video.scripts.propagate_reseed \
+    --clip blackswan --instance-id 1 \
+    --reseed-interval 10 --reseed-thresh 0.3 \
+    --conquer \
+    --out video/outputs/blackswan.mp4
+
+# High-quality mode: 128×128 OT grid (sharper boundaries, ~8× slower)
+python -m video.scripts.propagate_reseed \
+    --clip breakdance --instance-id 1 \
+    --reseed-interval 10 --conquer \
+    --feat-size 2048 \
+    --out video/outputs/breakdance_hq.mp4
+
+# Full DAVIS 2016 val eval (20 clips, ~30 min)
+python -m video.scripts.eval_davis2016 --refine --crf-conf 0.65 --crf-compat 20
+
+# Full eval at 128×128 grid (~8× slower, higher boundary precision)
+python -m video.scripts.eval_davis2016 --refine --crf-conf 0.65 --crf-compat 20 --feat-size 2048
+```
+
+### Setup
 
 ```bash
 # DAVIS 2017 trainval (~800 MB)
@@ -81,29 +276,27 @@ mkdir -p datasets/davis && cd datasets/davis
 wget https://data.vision.ee.ethz.ch/csergi/share/davis/DAVIS-2017-trainval-480p.zip
 unzip -q DAVIS-2017-trainval-480p.zip && cd ../..
 
-# SAM diagnostic (only if you'll pass --sam)
-.venv/bin/pip install segment-anything
-mkdir -p checkpoints
-wget -O checkpoints/sam_vit_h_4b8939.pth https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
-
-# HuggingFace login for the gated DINOv3 weights
+# HuggingFace login for DINOv3 weights (first run only)
 huggingface-cli login
+
+# pydensecrf for Dense CRF refinement
+pip install pydensecrf
 ```
 
-#### Common knobs
+### Code layout
 
-- `--upscale {1.0, 2.0}` — DINOv3 feature-grid resolution; 2.0 is the practical default on a 5090.
-- `--blur 0.05` — Sinkhorn entropic regularisation; robust across 0.02–0.2.
-- `--threshold 0.5` — binarisation cutoff as a fraction of heatmap max.
-- `--instance-id N` — which DAVIS annotation instance to use as the source mask at frame A.
-
-### Status
-
-- Phase 1 ✅ (DINOv3 ViT-L/16, bf16, ~2.6 GB peak on 5090)
-- Phase 2 ✅ (single-hop OT + 2× upscale; chained-hop OT works on easy/medium, fails on multi-instance content)
-- Phase 3 — KV memory module (next)
-- Phase 4 — self-training loop
-- Phase 5 — DAVIS / YouTube-VOS evaluation
+| Path | What it does |
+|---|---|
+| `demo.py` | Gradio demo — click-to-track on any DAVIS clip; Standard/High quality toggle |
+| `video/features/dinov3_dense.py` | DINOv3 ViT-L/16 dense feature extractor (resolution-agnostic) |
+| `video/divide/cuvler_divide.py` | CuVLER class-agnostic proposals |
+| `video/divide/conquer.py` | DINOv3 spectral sub-mask generation |
+| `video/propagation/sinkhorn_ot.py` | Sinkhorn OT (`propagate_patch`, `propagate_multiscale`); optional spatial and motion priors |
+| `video/refine/dense_crf.py` | Dense CRF boundary refinement |
+| `video/scripts/propagate_reseed.py` | Main CLI with video output; `--feat-size`, `--spatial-weight`, `--motion-weight` |
+| `video/scripts/eval_davis2016.py` | DAVIS 2016 aggregate eval; `--feat-size`, `--spatial-weight`, `--motion-weight` |
+| `video/divide/click_grow.py` | Click-seeded feature-similarity mask extraction |
+| `DinoMaskExtraction/` | DINOv3 feature inspector (Basti) |
 
 ---
 
