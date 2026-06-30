@@ -73,6 +73,36 @@ def _sinkhorn_log(cost: torch.Tensor, mu: torch.Tensor, nu: torch.Tensor,
     return torch.exp(log_T)
 
 
+def compute_cond(
+    feats_a: torch.Tensor,    # [gh_a, gw_a, D] L2-normalised
+    feats_b: torch.Tensor,    # [gh_b, gw_b, D] L2-normalised
+    blur: float = 0.05,
+    sinkhorn_iters: int = 200,
+    device: str = "cuda",
+    cost_addend: torch.Tensor | None = None,  # [N_a, N_b] extra cost (e.g. color)
+) -> torch.Tensor:
+    """Compute the forward conditional cond = P(b|a) = T / μ once for reuse.
+
+    Returns [N_a, N_b] with rows summing to 1. Push any source-patch indicator
+    m_a [N_a] forward via  m_b = m_a @ cond.  For competitive multi-object label
+    propagation, stack K label indicators M [K, N_a] and do M @ cond → [K, N_b],
+    then argmax over K. Because rows sum to 1, every target patch receives the same
+    total mass (N_a/N_b), so the argmax competition between labels is fair.
+    """
+    gh_a, gw_a, D = feats_a.shape
+    gh_b, gw_b, _ = feats_b.shape
+    N_a, N_b = gh_a * gw_a, gh_b * gw_b
+    fa = feats_a.reshape(N_a, D).to(device).float()
+    fb = feats_b.reshape(N_b, D).to(device).float()
+    mu = torch.full((N_a,), 1.0 / N_a, device=device)
+    nu = torch.full((N_b,), 1.0 / N_b, device=device)
+    cost = 1.0 - fa @ fb.T
+    if cost_addend is not None:
+        cost = cost + cost_addend.to(device).float()
+    T = _sinkhorn_log(cost, mu, nu, eps=blur ** 2, n_iter=sinkhorn_iters)
+    return T / mu[:, None]  # [N_a, N_b], rows sum to 1
+
+
 def propagate_patch(
     feats_a: torch.Tensor,    # [gh_a, gw_a, D] L2-normalised
     feats_b: torch.Tensor,    # [gh_b, gw_b, D] L2-normalised

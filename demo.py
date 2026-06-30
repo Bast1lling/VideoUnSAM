@@ -20,6 +20,7 @@ import cv2
 import gradio as gr
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 _REPO = Path(__file__).resolve().parent
@@ -40,6 +41,9 @@ OT_THRESH = 0.5
 OT_BLUR = 0.05
 OT_COLOR_WEIGHT = 0.2      # LAB color cost blended into Sinkhorn cost matrix
 CRF_CONF = 0.65
+PROBE_FUSE_WEIGHT = 0.5    # heat = (1-w)*OT + w*probe ; appearance probe vs OT propagation
+PROBE_STEPS = 100          # gradient steps to train the frame-0 instance probe
+PROBE_LR = 0.01
 
 _PREVIEW_CACHE: dict[str, str] = {}  # clip -> path to preview mp4
 
@@ -153,6 +157,43 @@ def _color_cost(frame_a: np.ndarray, frame_b: np.ndarray,
     return OT_COLOR_WEIGHT * dist / (dist.max() + 1e-8)
 
 
+def _patch_labels(mask: np.ndarray, gh: int, gw: int) -> torch.Tensor:
+    """Binary per-patch label [gh*gw] — patch is positive if >50% covered by mask."""
+    m = torch.from_numpy(mask.astype(np.float32))[None, None]
+    pooled = F.adaptive_avg_pool2d(m, (gh, gw))[0, 0]
+    return (pooled.flatten() > 0.5).float().cuda()
+
+
+def _train_probe(feats_flat: torch.Tensor, y: torch.Tensor,
+                 steps: int = PROBE_STEPS, lr: float = PROBE_LR) -> nn.Module:
+    """Test-time adaptation: train a 1-layer linear probe to recognise the clicked
+    instance. Supervision is the unsupervised seed mask (no labels). Frozen DINOv3
+    features in, instance-discriminative logit out — learns to separate this object
+    from look-alike distractors (a second dancer, similar background texture) that
+    cosine-similarity OT cannot tell apart.
+    """
+    D = feats_flat.shape[1]
+    probe = nn.Linear(D, 1).cuda()
+    opt = torch.optim.Adam(probe.parameters(), lr=lr)
+    n_pos = y.sum().clamp_min(1)
+    n_neg = (1 - y).sum().clamp_min(1)
+    lossf = nn.BCEWithLogitsLoss(pos_weight=(n_neg / n_pos).detach())
+    feats_flat = feats_flat.detach()
+    for _ in range(steps):
+        opt.zero_grad()
+        lossf(probe(feats_flat).squeeze(-1), y).backward()
+        opt.step()
+    probe.eval()
+    return probe
+
+
+@torch.no_grad()
+def _probe_score(probe: nn.Module, feats_norm: torch.Tensor) -> torch.Tensor:
+    """Per-patch instance probability [N] in [0,1] for a [gh, gw, D] feature grid."""
+    flat = feats_norm.reshape(-1, feats_norm.shape[-1])
+    return torch.sigmoid(probe(flat).squeeze(-1))
+
+
 def _overlay(frame: np.ndarray, mask: np.ndarray, color: tuple, alpha: float = 0.45) -> np.ndarray:
     out = frame.copy()
     m = mask.astype(bool)
@@ -166,7 +207,7 @@ def _overlay(frame: np.ndarray, mask: np.ndarray, color: tuple, alpha: float = 0
 # ── core pipeline ─────────────────────────────────────────────────────────────
 
 def run_pipeline(clip: str, click_x: float, click_y: float,
-                 refine: bool, feat_size: int = 1024,
+                 refine: bool, feat_size: int = 1024, use_probe: bool = True,
                  progress=gr.Progress()) -> str:
     """Run the full pipeline and return path to output video."""
     n = davis.num_frames(clip)
@@ -205,6 +246,13 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
     patch = _mask_to_patch(cur_mask, gh=gh_feat, gw=gw_feat)
     frame_prev = frame0
 
+    # Test-time adaptation: train a frame-0 instance probe on the seed mask.
+    probe = None
+    if use_probe and cur_mask.sum() > 0:
+        progress(0.04, desc="Training instance probe (test-time adaptation)…")
+        y0 = _patch_labels(cur_mask, gh_feat, gw_feat)
+        probe = _train_probe(feats_prev_norm.reshape(-1, feats_prev_norm.shape[-1]), y0)
+
     frames_out = []
 
     # frame 0
@@ -227,6 +275,16 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
         color_cost = _color_cost(frame_prev, frame, gh_feat, gw_feat, gh_cur, gw_cur)
         heat = propagate_patch(feats_prev_norm, feats_cur_norm, patch, blur=OT_BLUR,
                                cost_addend=color_cost)
+        heat = heat / (heat.max() + 1e-8)  # [N_b] OT heat, peak-normalised
+
+        # Fuse with the appearance probe: OT carries spatial/temporal coherence,
+        # the memoryless probe re-acquires the instance after occlusion and rejects
+        # look-alike distractors. The fused (probe-corrected) mask feeds back into
+        # the chain, so a transient overlap no longer causes permanent identity loss.
+        if probe is not None:
+            score = _probe_score(probe, feats_cur_norm)  # [N_b] in [0,1]
+            heat = (1.0 - PROBE_FUSE_WEIGHT) * heat + PROBE_FUSE_WEIGHT * score
+
         heat_up = F.interpolate(
             heat.reshape(1, 1, gh_cur, gw_cur), size=(H, W), mode="bilinear", align_corners=False
         )[0, 0].cpu().numpy()
@@ -297,11 +355,12 @@ def on_click(clip: str, refine: bool, evt: gr.SelectData):
 
 
 def on_run(clip: str, cx_norm: float, cy_norm: float, refine: bool, quality: str,
-           progress=gr.Progress()):
+           use_probe: bool, progress=gr.Progress()):
     if cx_norm is None:
         return None, "Click on the object in frame 0 first."
     feat_size = 2048 if quality == "High (2048px — sharper boundaries, ~8× slower)" else 1024
-    video_path = run_pipeline(clip, cx_norm, cy_norm, refine, feat_size=feat_size, progress=progress)
+    video_path = run_pipeline(clip, cx_norm, cy_norm, refine, feat_size=feat_size,
+                              use_probe=use_probe, progress=progress)
     return video_path, "Done."
 
 
@@ -320,6 +379,7 @@ with gr.Blocks(title="VideoUnSAM") as demo:
                 label="DAVIS clip",
             )
             refine_cb = gr.Checkbox(value=True, label="Dense CRF refinement (unsupervised boundary sharpening)")
+            probe_cb = gr.Checkbox(value=True, label="Instance probe (test-time adaptation — re-acquires after occlusion, rejects look-alikes)")
             quality_radio = gr.Radio(
                 choices=["Standard (1024px — fast)", "High (2048px — sharper boundaries, ~8× slower)"],
                 value="Standard (1024px — fast)",
@@ -348,7 +408,7 @@ with gr.Blocks(title="VideoUnSAM") as demo:
     # run pipeline
     run_btn.click(
         fn=on_run,
-        inputs=[clip_dd, cx_state, cy_state, refine_cb, quality_radio],
+        inputs=[clip_dd, cx_state, cy_state, refine_cb, quality_radio, probe_cb],
         outputs=[out_video, status_txt],
     )
 
