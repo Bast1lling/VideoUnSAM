@@ -880,7 +880,7 @@ def main() -> None:
     p.add_argument("--image-dir",  default=_DEFAULT_IMAGE_DIR)
     p.add_argument("--config",     default=str(_THIS / "configs" / "video_sam_swinT.yaml"))
     p.add_argument("--weights",    default=str(_THIS / "ckpts"   / "baseline.pth"))
-    p.add_argument("--ckpt-dir",   default=str(_THIS / "output" / "video_ft" / "checkpoints"),
+    p.add_argument("--ckpt-dir",   default=str(_THIS / "output" / "video_ft_memory" / "checkpoints"),
                    help="directory of finetuned checkpoints to choose from")
     p.add_argument("--device",
                    default="cuda" if torch.cuda.is_available() else "cpu")
