@@ -9,7 +9,15 @@ import torch
 from torch import nn
 
 from detectron2.config import configurable
-from detectron2.data.detection_utils import get_fed_loss_cls_weights
+try:
+    from detectron2.data.detection_utils import get_fed_loss_cls_weights
+except ImportError:  # symbol removed/moved in some detectron2 versions; only needed for federated loss (training)
+    def get_fed_loss_cls_weights(*args, **kwargs):
+        raise ImportError(
+            "get_fed_loss_cls_weights is unavailable in this detectron2 version. "
+            "It is only required when MODEL.ROI_BOX_HEAD.USE_FED_LOSS=True (training). "
+            "Inference/the demo does not use it."
+        )
 from detectron2.layers import ShapeSpec, batched_nms, cat, cross_entropy, nonzero_tuple
 from detectron2.modeling.box_regression import Box2BoxTransform, _dense_box_regression_loss
 from detectron2.structures import Instances, Boxes

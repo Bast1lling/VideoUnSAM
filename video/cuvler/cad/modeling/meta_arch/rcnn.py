@@ -11,7 +11,11 @@ from torch import nn
 
 from detectron2.config import configurable
 from detectron2.data.detection_utils import convert_image_to_rgb
-from detectron2.layers import move_device_like
+try:
+    from detectron2.layers import move_device_like
+except ImportError:  # helper absent in some detectron2 versions
+    def move_device_like(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+        return src.to(dst.device)
 from detectron2.structures import ImageList, Instances
 from detectron2.utils.events import get_event_storage
 from detectron2.utils.logger import log_first_n
@@ -23,6 +27,23 @@ from ..roi_heads import build_roi_heads
 from .build import META_ARCH_REGISTRY
 
 __all__ = ["GeneralizedRCNN", "ProposalNetwork"]
+
+# `padding_constraints` was added to Backbone / ImageList.from_tensors in newer
+# detectron2 versions; older/other builds lack it. Detect support once and pass it
+# only when available, so this code runs across detectron2 versions.
+import inspect as _inspect
+_FROM_TENSORS_HAS_PADDING = "padding_constraints" in _inspect.signature(
+    ImageList.from_tensors).parameters
+
+
+def _image_list_from_tensors(images, backbone):
+    if _FROM_TENSORS_HAS_PADDING:
+        return ImageList.from_tensors(
+            images,
+            backbone.size_divisibility,
+            padding_constraints=getattr(backbone, "padding_constraints", None),
+        )
+    return ImageList.from_tensors(images, backbone.size_divisibility)
 
 
 @META_ARCH_REGISTRY.register()
@@ -232,11 +253,7 @@ class GeneralizedRCNN(nn.Module):
         """
         images = [self._move_to_current_device(x["image"]) for x in batched_inputs]
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
-        images = ImageList.from_tensors(
-            images,
-            self.backbone.size_divisibility,
-            padding_constraints=self.backbone.padding_constraints,
-        )
+        images = _image_list_from_tensors(images, self.backbone)
         return images
 
     @staticmethod
@@ -314,11 +331,7 @@ class ProposalNetwork(nn.Module):
         """
         images = [self._move_to_current_device(x["image"]) for x in batched_inputs]
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
-        images = ImageList.from_tensors(
-            images,
-            self.backbone.size_divisibility,
-            padding_constraints=self.backbone.padding_constraints,
-        )
+        images = _image_list_from_tensors(images, self.backbone)
         features = self.backbone(images.tensor)
 
         if "instances" in batched_inputs[0]:

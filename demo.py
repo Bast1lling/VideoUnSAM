@@ -45,6 +45,29 @@ PROBE_FUSE_WEIGHT = 0.5    # heat = (1-w)*OT + w*probe ; appearance probe vs OT 
 PROBE_STEPS = 100          # gradient steps to train the frame-0 instance probe
 PROBE_LR = 0.01
 
+def _resolve_ffmpeg() -> str | None:
+    """Locate an ffmpeg binary: system PATH first, then the imageio-ffmpeg bundle
+    (installed in the venv, no sudo needed). Returns None if neither is available."""
+    import shutil
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+_FFMPEG = _resolve_ffmpeg()
+
+
+def _log(msg: str) -> None:
+    """Stdout logging that survives Gradio's queue (which swallows exceptions/prints
+    from the worker thread otherwise). Flushed so lines appear immediately."""
+    print(f"[demo] {msg}", flush=True)
+
+
 _PREVIEW_CACHE: dict[str, str] = {}  # clip -> path to preview mp4
 
 
@@ -66,13 +89,16 @@ def _build_preview(clip: str) -> str:
         writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     writer.release()
 
-    out_path = tmp.name.replace("_preview_raw.mp4", "_preview.mp4")
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", tmp.name, "-vcodec", "libx264",
-         "-pix_fmt", "yuv420p", "-crf", "23", out_path],
-        capture_output=True,
-    )
-    result = out_path if Path(out_path).exists() else tmp.name
+    result = tmp.name
+    if _FFMPEG is not None:
+        out_path = tmp.name.replace("_preview_raw.mp4", "_preview.mp4")
+        subprocess.run(
+            [_FFMPEG, "-y", "-i", tmp.name, "-vcodec", "libx264",
+             "-pix_fmt", "yuv420p", "-crf", "23", out_path],
+            capture_output=True,
+        )
+        if Path(out_path).exists():
+            result = out_path
     _PREVIEW_CACHE[clip] = result
     return result
 
@@ -84,6 +110,9 @@ DAVIS_VAL_20 = [
     "motocross-jump", "paragliding-launch", "parkour", "scooter-black", "soapbox",
 ]
 ALL_CLIPS = davis.list_clips()
+# Prefer a known DAVIS clip if present, otherwise fall back to the first available
+# clip so the demo works on any dataset (e.g. YouTube-VIS) without a hardcoded name.
+_DEFAULT_CLIP = "blackswan" if "blackswan" in ALL_CLIPS else (ALL_CLIPS[0] if ALL_CLIPS else "")
 
 print("Loading models…")
 _dino = DenseDINOv3()
@@ -210,9 +239,12 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
                  refine: bool, feat_size: int = 1024, use_probe: bool = True,
                  progress=gr.Progress()) -> str:
     """Run the full pipeline and return path to output video."""
+    _log(f"=== run_pipeline START clip={clip!r} click=({click_x:.3f},{click_y:.3f}) "
+         f"feat_size={feat_size} refine={refine} use_probe={use_probe} ===")
     n = davis.num_frames(clip)
     frame0 = davis.load_frame(clip, 0)
     H, W = frame0.shape[:2]
+    _log(f"frame0 loaded: {n} frames, HxW={H}x{W}")
 
     click_xy = (click_x * W, click_y * H)
 
@@ -221,10 +253,13 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
         feats_prev = _dino.extract(img_sized, normalize=False)["feats"].cuda().float()
     feats_prev_norm = F.normalize(feats_prev, dim=-1)
     gh_feat, gw_feat = feats_prev_norm.shape[:2]  # 64 at 1024px, 128 at 2048px
+    _log(f"DINOv3 features: grid={gh_feat}x{gw_feat} dim={feats_prev_norm.shape[-1]}")
 
     progress(0.05, desc="Seeding frame 0 with CuVLER + conquer…")
     proposals = _divider.predict(frame0)
+    _log(f"CuVLER proposals: {len(proposals)}")
     proposals = run_conquer(_conquer_bb, frame0, proposals)
+    _log(f"after conquer: {len(proposals)} proposals")
     # Frame 0: pick seed containing click.
     # If the largest candidate covers > 40% of the frame it's a merged blob
     # (e.g. all 3 dancers detected as one region) — prefer smallest in that case.
@@ -241,8 +276,12 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
         seed = max(proposals, key=lambda m: m.sum()) if proposals else None
     if seed is None:
         seed = np.zeros((H, W), dtype=np.uint8)
+        _log("WARNING: no seed proposal found (empty seed); click may be off-object")
 
     cur_mask = seed.astype(np.uint8)
+    _log(f"seed selected: area={int(cur_mask.sum())}px "
+         f"({100.0 * cur_mask.sum() / (H * W):.2f}% of frame), "
+         f"containing_click={len(containing0)} proposals")
     patch = _mask_to_patch(cur_mask, gh=gh_feat, gw=gw_feat)
     frame_prev = frame0
 
@@ -250,19 +289,26 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
     probe = None
     if use_probe and cur_mask.sum() > 0:
         progress(0.04, desc="Training instance probe (test-time adaptation)…")
+        _log("training instance probe…")
         y0 = _patch_labels(cur_mask, gh_feat, gw_feat)
         probe = _train_probe(feats_prev_norm.reshape(-1, feats_prev_norm.shape[-1]), y0)
+        _log("instance probe trained")
+    else:
+        _log(f"instance probe skipped (use_probe={use_probe}, seed_area={int(cur_mask.sum())})")
 
     frames_out = []
 
     # frame 0
+    _log("frame 0: CRF/overlay…")
     soft0 = cur_mask.astype(np.float32)
     display0 = crf_refine(frame0, soft0, dino_feats=_dino.extract(img_sized, normalize=False)["feats"].cpu()) \
         if refine and crf_confidence(soft0) >= CRF_CONF else cur_mask
     frames_out.append(_overlay(frame0, display0, (0, 120, 255)))
+    _log(f"frame 0 done. Propagating over {n - 1} remaining frames…")
 
     for fidx in range(1, n):
         progress(0.05 + 0.90 * fidx / n, desc=f"Frame {fidx}/{n-1}")
+        _log(f"frame {fidx}/{n - 1}: load+features")
         frame = davis.load_frame(clip, fidx)
         img_sized = cv2.resize(frame, (feat_size, feat_size))
 
@@ -272,6 +318,7 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
         feats_cur_norm = F.normalize(feats_cur, dim=-1)
         gh_cur, gw_cur = feats_cur_norm.shape[:2]
 
+        _log(f"frame {fidx}: OT propagate (grid {gh_cur}x{gw_cur})")
         color_cost = _color_cost(frame_prev, frame, gh_feat, gw_feat, gh_cur, gw_cur)
         heat = propagate_patch(feats_prev_norm, feats_cur_norm, patch, blur=OT_BLUR,
                                cost_addend=color_cost)
@@ -292,8 +339,10 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
         ot_mask = (soft_up > OT_THRESH).astype(np.uint8)
         cur_mask = ot_mask
         patch = _mask_to_patch(ot_mask, gh=gh_feat, gw=gw_feat)
+        _log(f"frame {fidx}: ot_mask area={int(ot_mask.sum())}px")
 
         if RESEED_INTERVAL > 0 and fidx % RESEED_INTERVAL == 0:
+            _log(f"frame {fidx}: reseed (CuVLER+conquer)")
             props = _divider.predict(frame)
             props += _crop_proposals(frame, ot_mask, RESEED_CROP_CONTEXT)
             props = run_conquer(_conquer_bb, frame, props)
@@ -301,8 +350,12 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
             if candidate is not None and _iou(ot_mask, candidate) >= RESEED_THRESH:
                 cur_mask = candidate
                 patch = _mask_to_patch(cur_mask, gh=gh_feat, gw=gw_feat)
+                _log(f"frame {fidx}: reseed accepted (area={int(cur_mask.sum())}px)")
+            else:
+                _log(f"frame {fidx}: reseed rejected")
 
         if refine and crf_confidence(soft_up) >= CRF_CONF:
+            _log(f"frame {fidx}: CRF refine")
             display = crf_refine(frame, soft_up, dino_feats=feats_cur_raw.cpu())
         else:
             display = cur_mask
@@ -311,6 +364,7 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
         feats_prev_norm = feats_cur_norm
         frame_prev = frame
 
+    _log(f"propagation done ({len(frames_out)} frames). Encoding…")
     progress(0.97, desc="Encoding video…")
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     tmp.close()
@@ -321,16 +375,29 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
         writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
     writer.release()
 
-    # re-encode to H.264 for browser playback
-    out_path = tmp.name.replace(".mp4", "_h264.mp4")
-    import subprocess
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", tmp.name, "-vcodec", "libx264",
-         "-pix_fmt", "yuv420p", "-crf", "20", out_path],
-        capture_output=True,
-    )
+    _log(f"raw mp4 written: {tmp.name}")
+    # re-encode to H.264 for browser playback (raw mp4v often won't play in-browser)
+    if _FFMPEG is not None:
+        out_path = tmp.name.replace(".mp4", "_h264.mp4")
+        proc = subprocess.run(
+            [_FFMPEG, "-y", "-i", tmp.name, "-vcodec", "libx264",
+             "-pix_fmt", "yuv420p", "-crf", "20", out_path],
+            capture_output=True,
+        )
+        if Path(out_path).exists():
+            tmp_result = out_path
+            _log(f"H.264 re-encode OK: {out_path}")
+        else:
+            tmp_result = tmp.name
+            _log(f"WARNING: ffmpeg re-encode failed (rc={proc.returncode}); "
+                 f"returning raw mp4v (may not play in browser). "
+                 f"stderr tail: {proc.stderr.decode('utf-8', 'ignore')[-300:]}")
+    else:
+        tmp_result = tmp.name
+        _log("WARNING: no ffmpeg; returning raw mp4v (may not play in browser)")
     progress(1.0, desc="Done.")
-    return out_path if Path(out_path).exists() else tmp.name
+    _log(f"=== run_pipeline DONE -> {tmp_result} ===")
+    return tmp_result
 
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
@@ -359,8 +426,14 @@ def on_run(clip: str, cx_norm: float, cy_norm: float, refine: bool, quality: str
     if cx_norm is None:
         return None, "Click on the object in frame 0 first."
     feat_size = 2048 if quality == "High (2048px — sharper boundaries, ~8× slower)" else 1024
-    video_path = run_pipeline(clip, cx_norm, cy_norm, refine, feat_size=feat_size,
-                              use_probe=use_probe, progress=progress)
+    try:
+        video_path = run_pipeline(clip, cx_norm, cy_norm, refine, feat_size=feat_size,
+                                  use_probe=use_probe, progress=progress)
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        print(tb)  # full traceback to terminal (Gradio's queue swallows exceptions)
+        return None, f"Error:\n{tb.strip().splitlines()[-1]}"
     return video_path, "Done."
 
 
@@ -375,8 +448,8 @@ with gr.Blocks(title="VideoUnSAM") as demo:
         with gr.Column(scale=1):
             clip_dd = gr.Dropdown(
                 choices=ALL_CLIPS,
-                value="blackswan",
-                label="DAVIS clip",
+                value=_DEFAULT_CLIP,
+                label="Clip",
             )
             refine_cb = gr.Checkbox(value=True, label="Dense CRF refinement (unsupervised boundary sharpening)")
             probe_cb = gr.Checkbox(value=True, label="Instance probe (test-time adaptation — re-acquires after occlusion, rejects look-alikes)")

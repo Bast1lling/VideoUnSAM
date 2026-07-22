@@ -9,7 +9,11 @@ from torch.nn import functional as F
 
 from detectron2.config import configurable
 from detectron2.layers import Conv2d, ConvTranspose2d, ShapeSpec, cat, get_norm
-from detectron2.layers.wrappers import move_device_like
+try:
+    from detectron2.layers.wrappers import move_device_like
+except ImportError:  # helper absent in some detectron2 versions
+    def move_device_like(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+        return src.to(dst.device)
 from detectron2.structures import Instances
 from detectron2.utils.events import get_event_storage
 from detectron2.modeling.roi_heads.mask_head import BaseMaskRCNNHead, ROI_MASK_HEAD_REGISTRY, mask_rcnn_loss
