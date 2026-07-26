@@ -187,6 +187,43 @@ def crf_snap(soft_up, frame_rgb, props, pca3=None, thresh: float = 0.5,
                 thresh=0.5, region_thresh=region_thresh, agg="frac")
 
 
+def flow_snap(soft_up, frame_rgb, props, flow_mask=None, thresh: float = 0.5,
+              blend: float = 0.5, **_):
+    """Blend the OT heat threshold with a SMURF-flow-warped previous-frame mask.
+
+    flow_mask is precomputed offline by video/flow/dump_flow_masks.py: the
+    previous frame's ot_mask, warped forward with the YouTube-VIS fine-tuned
+    SMURF model. That model's biggest, most reproducible win over the `copy`
+    control was boundary (F) accuracy, not region (J) accuracy (see
+    video/flow/results/README.md) -- i.e. it is dense and pixel-resolution
+    exactly where the OT heatmap is a blocky 64x64 grid. blend=0 reproduces
+    baseline; blend=1 is pure flow warp (no OT heat at all, so it will drift
+    on frames where the previous mask was already wrong -- see blend<1 first).
+    """
+    base = (soft_up > thresh).astype(np.float32)
+    if flow_mask is None:
+        return base.astype(np.uint8)
+    fused = (1 - blend) * base + blend * flow_mask.astype(np.float32)
+    return (fused > 0.5).astype(np.uint8)
+
+
+def flow_guided_snap(soft_up, frame_rgb, props, flow_mask=None, thresh: float = 0.5,
+                     region_thresh: float = 0.35, agg: str = "frac", **_):
+    """Region-snap (see `snap`) with the flow-warped mask as an extra candidate
+    region, competing with conquer's proposals instead of being blended in.
+
+    Unlike flow_snap's pixel blend, a bad flow warp here can only be rejected
+    outright (its region simply scores below region_thresh) rather than
+    dragging the fused probability around -- worth A/B'ing against flow_snap
+    for exactly that reason.
+    """
+    extra = list(props) if props else []
+    if flow_mask is not None and flow_mask.sum() >= 20:
+        extra = extra + [flow_mask.astype(np.uint8)]
+    return snap(soft_up, frame_rgb, extra, thresh=thresh,
+                region_thresh=region_thresh, agg=agg)
+
+
 REFINERS = {
     "baseline": baseline,
     "guided": guided,
@@ -195,7 +232,12 @@ REFINERS = {
     "guided_snap": guided_snap,
     "crf": crf,
     "crf_snap": crf_snap,
+    "flow_snap": flow_snap,
+    "flow_guided_snap": flow_guided_snap,
 }
 
 # Refiners whose result depends on the precomputed PCA-3 feature image.
 NEEDS_PCA = {"crf", "crf_snap"}
+
+# Refiners whose result depends on the precomputed flow-warped mask sidecar.
+NEEDS_FLOW = {"flow_snap", "flow_guided_snap"}

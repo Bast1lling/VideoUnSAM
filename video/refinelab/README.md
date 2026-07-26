@@ -39,6 +39,27 @@ Then pull it down:
 scp -P 58022 -r s0041@<workstation>.in.tum.de:/storage/slurm/s0041/dumps/davis2016_default ./dumps/
 ```
 
+## Step 1b — flow sidecar (TF venv, optional, once)
+
+Only needed for `flow_snap` / `flow_guided_snap`. SMURF (`video/flow/`) needs the
+project's separate TF venv (`.venv-tf`, see `video/flow/README.md`) -- it cannot be
+imported into the same process as `dump_artifacts.py`, which is PyTorch/DINOv3. So
+this is a second pass over the *existing* dump, not an extra flag on step 1:
+
+```bash
+source .venv-tf/bin/activate
+python -m video.flow.dump_flow_masks \
+    --dump dumps/davis2016_default \
+    --checkpoint_dir=$HOME/smurf_ckpts/ytvis_finetuned
+```
+
+Writes `dump/flow/<clip>/<fidx>.npz` — the previous frame's `ot_mask` warped forward
+with SMURF flow, bit-packed like everything else in the dump. `bench.py` loads it with
+plain numpy, no TF import needed at bench time. Note this warps the chain's *actual*
+`ot_mask` (right or wrong), not ground truth — deliberately different from
+`video/flow/eval_flow_warp_davis.py`'s oracle-initialised GT-to-GT numbers, since this
+is what a real refiner would have to work with at inference time.
+
 ## Step 2 — iterate (laptop)
 
 ```bash
@@ -75,6 +96,8 @@ python -m video.refinelab.bench --dump dumps/davis2016_default \
 | `snap_best` | Take only the single best-scoring proposal. Control for whether `snap`'s gains come from boundary quality or from unioning extra regions. |
 | `guided_snap` | Guided filter to clean the heat, then region snapping. |
 | `crf` / `crf_snap` | The current Dense CRF, for A/B. Needs `pydensecrf`. |
+| `flow_snap` | Blend the OT-heat threshold with the SMURF-warped previous-frame mask (needs the flow sidecar, step 1b). `blend` controls the mix; a bad flow warp can drag the fused probability around, so sweep `blend` low-to-high rather than starting at 0.5. |
+| `flow_guided_snap` | Same flow-warped mask, but as one more candidate region for `snap`'s region-vote instead of a pixel blend — a bad warp is simply outvoted rather than blended in. Worth A/B'ing against `flow_snap` for exactly that difference. |
 
 `snap` is the idea worth the most attention: conquer already produces ~30 tight,
 pixel-resolution sub-masks per frame via DINOv3 spectral clustering. Their boundaries

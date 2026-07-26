@@ -34,7 +34,7 @@ from scipy.ndimage import binary_dilation, binary_erosion
 _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO))
 
-from video.refinelab.refiners import REFINERS, NEEDS_PCA  # noqa: E402
+from video.refinelab.refiners import REFINERS, NEEDS_PCA, NEEDS_FLOW  # noqa: E402
 
 # Parameters that alter the OT chain itself, so an offline result is NOT faithful.
 CHAIN_PARAMS = {"thresh"}
@@ -72,7 +72,8 @@ def _unpack(bits: np.ndarray, shape) -> np.ndarray:
     return np.unpackbits(bits)[: h * w].reshape(h, w).astype(np.uint8)
 
 
-def load_frame(dump: Path, clip: str, fidx: int, want_props: bool, want_pca: bool):
+def load_frame(dump: Path, clip: str, fidx: int, want_props: bool, want_pca: bool,
+              want_flow: bool = False):
     z = np.load(dump / "npz" / clip / f"{fidx:05d}.npz")
     shape = z["shape"]
     h, w = int(shape[0]), int(shape[1])
@@ -95,7 +96,15 @@ def load_frame(dump: Path, clip: str, fidx: int, want_props: bool, want_pca: boo
                 props = [mask_util.decode(r) for r in pickle.load(fh)]
 
     pca3 = z["pca3"] if (want_pca and "pca3" in z) else None
-    return soft_up, frame_rgb, gt, props, pca3
+
+    flow_mask = None
+    if want_flow:
+        fp = dump / "flow" / clip / f"{fidx:05d}.npz"
+        if fp.exists():
+            fz = np.load(fp)
+            flow_mask = _unpack(fz["flow_mask"], fz["shape"]).astype(np.float32)
+
+    return soft_up, frame_rgb, gt, props, pca3, flow_mask
 
 
 def clips_in(dump: Path) -> list[str]:
@@ -113,16 +122,19 @@ def evaluate(dump: Path, refiner_name: str, params: dict,
     fn = REFINERS[refiner_name]
     want_props = "snap" in refiner_name
     want_pca = refiner_name in NEEDS_PCA
+    want_flow = refiner_name in NEEDS_FLOW
 
     rows, all_j, all_f = [], [], []
     for clip in clips:
         js, fs = [], []
         for fidx in frames_in(dump, clip):
-            soft_up, frame_rgb, gt, props, pca3 = load_frame(
-                dump, clip, fidx, want_props, want_pca)
+            soft_up, frame_rgb, gt, props, pca3, flow_mask = load_frame(
+                dump, clip, fidx, want_props, want_pca, want_flow)
             kw = dict(params)
             if want_pca:
                 kw["pca3"] = pca3
+            if want_flow:
+                kw["flow_mask"] = flow_mask
             pred = fn(soft_up, frame_rgb, props, **kw)
             if gt.sum() > 0:
                 js.append(j_score(pred, gt))
