@@ -82,6 +82,14 @@ class CuVLERDivider:
 
     def predict(self, frame_rgb: np.ndarray) -> list[np.ndarray]:
         """RGB uint8 [H, W, 3] -> list of binary masks [H, W] uint8 (full frame)."""
+        masks, _ = self.predict_scored(frame_rgb)
+        return masks
+
+    def predict_scored(self, frame_rgb: np.ndarray) -> tuple[list[np.ndarray], list[float]]:
+        """Same as predict(), but also returns each mask's detector confidence
+        score — needed to rank/de-duplicate proposals for whole-image (no-click)
+        use, where predict()'s plain mask list isn't enough to tell which
+        candidates are trustworthy."""
         torch = self._torch
         with torch.no_grad():
             im = frame_rgb[:, :, ::-1] if self.rgb_input else frame_rgb
@@ -90,7 +98,8 @@ class CuVLERDivider:
             t = torch.as_tensor(t.astype("float32").transpose(2, 0, 1))
             inst = self.model([{"image": t, "height": h, "width": w}])[0]["instances"]
             m = inst.get("pred_masks").cpu().numpy().astype(np.uint8)
-        return [m[i] for i in range(m.shape[0])]
+            s = inst.get("scores").cpu().numpy().astype(np.float32)
+        return [m[i] for i in range(m.shape[0])], [float(s[i]) for i in range(m.shape[0])]
 
 
 if __name__ == "__main__":

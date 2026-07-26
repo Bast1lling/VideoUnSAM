@@ -147,3 +147,140 @@ def run_conquer(
         all_masks.extend(conquer_masks)
 
     return all_masks
+
+
+def run_conquer_scored(
+    backbone: ViTFeatV3,
+    image_rgb: np.ndarray,
+    divide_masks: list[np.ndarray],
+    divide_scores: list[float],
+    params: SimpleNamespace = DEFAULT_PARAMS,
+) -> tuple[list[np.ndarray], list[float]]:
+    """Same as run_conquer, but also returns a confidence score per mask —
+    needed to rank the ~30-40x over-generated proposal pool for whole-image
+    (no-click) consolidation. Divide masks keep their detector score; conquer
+    sub-masks inherit `divide_score * coverage_of_parent` (coverage is already
+    computed to decide accept/reject, just also kept here) as a cheap proxy —
+    conquer produces no score of its own, so a submask that barely covers its
+    parent is trusted less than a near-total re-derivation of it.
+    """
+    all_masks = list(divide_masks)
+    all_scores = list(divide_scores)
+    feat_num = params.local_size // params.patch_size
+
+    for divide_mask, divide_score in zip(divide_masks, divide_scores):
+        ymin, ymax, xmin, xmax = _bbox(divide_mask)
+        if (ymax - ymin) <= 0 or (xmax - xmin) <= 0:
+            continue
+
+        crop = image_rgb[ymin:ymax, xmin:xmax]
+        pil_crop = Image.fromarray(crop).resize((params.local_size, params.local_size))
+        feature_matrix = _generate_feature_matrix(backbone, pil_crop, params.feature_dim, feat_num)
+
+        merging_masks = iterative_merge(feature_matrix, params.thetas)
+        conquer_masks, conquer_scores = [], []
+        for layer in merging_masks:
+            if layer.shape[0] == 0:
+                continue
+            for i in range(layer.shape[0]):
+                m = _resize_mask(layer[i], (xmax - xmin, ymax - ymin))
+                cov = _coverage(m, divide_mask[ymin:ymax, xmin:xmax])
+                if cov <= params.kept_thresh:
+                    continue
+                full = np.zeros_like(divide_mask)
+                full[ymin:ymax, xmin:xmax] = m
+                conquer_masks.append(full)
+                conquer_scores.append(divide_score * cov)
+
+        conquer_masks, conquer_scores = _nms_scored(conquer_masks, conquer_scores, params.nms_iou, params.nms_step)
+        all_masks.extend(conquer_masks)
+        all_scores.extend(conquer_scores)
+
+    return all_masks, all_scores
+
+
+def run_conquer_one_per_object(
+    backbone: ViTFeatV3,
+    image_rgb: np.ndarray,
+    divide_masks: list[np.ndarray],
+    divide_scores: list[float] | None = None,
+    params: SimpleNamespace = DEFAULT_PARAMS,
+) -> tuple[list[np.ndarray], list[float]]:
+    """One representative mask per divide-object — for whole-image (no-click)
+    output, where run_conquer/run_conquer_scored's every-granularity pool (~10-40
+    masks per object, mostly non-overlapping PARTS of the same object) can't be
+    cleaned up by NMS (parts don't overlap each other, so IoU-based suppression
+    can't merge them back together — see eval_whole_image_ar.py findings).
+
+    iterative_merge's clustering is cumulative across its threshold schedule
+    (thetas decreasing => more merging at each step), so merging_masks[-1] is
+    the coarsest/most-merged layer and merging_masks[0] the finest. We scan
+    coarsest-first and take the first layer with a cluster covering >= kept_thresh
+    of the parent divide mask — i.e. the most-merged "whole object" reconstruction
+    conquer can produce, not every intermediate part. Falls back to the divide
+    mask itself if no layer ever reaches kept_thresh coverage.
+
+    Does NOT replace run_conquer/run_conquer_scored — those still feed the click
+    pipeline (demo.py, eval_davis2016.py), which benefits from having many
+    granularities to search for the best match to a specific click.
+    """
+    scores_in = divide_scores if divide_scores is not None else [1.0] * len(divide_masks)
+    feat_num = params.local_size // params.patch_size
+    out_masks, out_scores = [], []
+
+    for divide_mask, divide_score in zip(divide_masks, scores_in):
+        ymin, ymax, xmin, xmax = _bbox(divide_mask)
+        if (ymax - ymin) <= 0 or (xmax - xmin) <= 0:
+            out_masks.append(divide_mask)
+            out_scores.append(divide_score)
+            continue
+
+        crop = image_rgb[ymin:ymax, xmin:xmax]
+        pil_crop = Image.fromarray(crop).resize((params.local_size, params.local_size))
+        feature_matrix = _generate_feature_matrix(backbone, pil_crop, params.feature_dim, feat_num)
+        merging_masks = iterative_merge(feature_matrix, params.thetas)
+
+        # Rank candidates by AREA (among those clearing the coverage floor), not by
+        # coverage itself: _coverage(m, parent) = |m ∩ parent| / |m| is a precision-like
+        # measure that a tiny fragment sitting entirely inside the object satisfies
+        # trivially (coverage=1.0). Ranking by coverage would pick slivers over the
+        # whole object; ranking by area picks the largest mostly-correct region.
+        best_mask, best_area, best_cov = None, -1, None
+        for layer in reversed(merging_masks):  # coarsest first
+            if layer.shape[0] == 0:
+                continue
+            for i in range(layer.shape[0]):
+                m = _resize_mask(layer[i], (xmax - xmin, ymax - ymin))
+                cov = _coverage(m, divide_mask[ymin:ymax, xmin:xmax])
+                if cov <= params.kept_thresh:
+                    continue
+                area = int(m.sum())
+                if area > best_area:
+                    best_area, best_cov = area, cov
+                    full = np.zeros_like(divide_mask)
+                    full[ymin:ymax, xmin:xmax] = m
+                    best_mask = full
+            if best_mask is not None:
+                break  # this (coarsest qualifying) layer wins; stop descending to finer ones
+
+        if best_mask is not None:
+            out_masks.append(best_mask)
+            out_scores.append(divide_score * best_cov)
+        else:
+            out_masks.append(divide_mask)
+            out_scores.append(divide_score)
+
+    return out_masks, out_scores
+
+
+def _nms_scored(masks: list[np.ndarray], scores: list[float],
+                threshold: float, step: int) -> tuple[list[np.ndarray], list[float]]:
+    """Same greedy suppression as _nms, but ordered by score instead of area."""
+    order = sorted(range(len(masks)), key=lambda i: scores[i], reverse=True)
+    kept = set(range(len(order)))
+    for i in range(len(order)):
+        if i in kept:
+            for j in range(i + 1, min(len(order), i + step)):
+                if _iou(masks[order[i]], masks[order[j]]) > threshold:
+                    kept.discard(j)
+    return [masks[order[i]] for i in sorted(kept)], [scores[order[i]] for i in sorted(kept)]

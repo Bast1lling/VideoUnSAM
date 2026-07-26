@@ -90,3 +90,31 @@ class DenseDINOv3:
     def extract_batch(self, frames_rgb: list[np.ndarray], normalize: bool = True) -> list[dict]:
         """Per-frame extraction (frames may differ in size). Loops internally."""
         return [self.extract(f, normalize=normalize) for f in frames_rgb]
+
+    @torch.no_grad()
+    def extract_batch_same_size(self, frames_rgb: list[np.ndarray],
+                                normalize: bool = True) -> list[dict]:
+        """True batched extraction: all frames must already share H, W (e.g. pre-resized
+        to the same feat_size). Stacks into one [B, 3, H, W] forward pass instead of B
+        separate single-image passes — much better GPU utilization/throughput than
+        `extract_batch`, at the cost of B frames' activations resident in VRAM at once."""
+        if not frames_rgb:
+            return []
+        tensors, phs, pws, Hs, Ws = [], [], [], [], []
+        for f in frames_rgb:
+            t, ph, pw, H, W = self._prep(f)
+            tensors.append(t)
+            phs.append(ph); pws.append(pw); Hs.append(H); Ws.append(W)
+        batch = torch.cat(tensors, dim=0)  # [B, 3, H, W]
+
+        feats = self.backbone(batch)  # [B, feat_dim, n_spatial]
+        out = []
+        for i in range(len(frames_rgb)):
+            gh = (Hs[i] + phs[i]) // self.patch_size
+            gw = (Ws[i] + pws[i]) // self.patch_size
+            fi = feats[i].reshape(self.feat_dim, gh, gw).permute(1, 2, 0).float().cpu()
+            if normalize:
+                fi = F.normalize(fi, dim=-1)
+            out.append({"feats": fi, "grid_h": gh, "grid_w": gw,
+                        "H": Hs[i], "W": Ws[i], "ph": phs[i], "pw": pws[i], "attn": None})
+        return out

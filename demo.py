@@ -34,6 +34,8 @@ from video.divide.conquer import load_backbone, run_conquer
 from video.propagation.sinkhorn_ot import propagate_patch, _mask_to_patch_indicator
 from video.refine.dense_crf import crf_refine, crf_confidence
 
+FEATURE_BATCH_SIZE = 16  # frames per batched DINOv3 forward pass at feat_size=1024
+                         # (scaled down for larger feat_size — see run_pipeline)
 RESEED_INTERVAL = 10
 RESEED_THRESH = 0.3
 RESEED_CROP_CONTEXT = 1.5  # expand OT mask bbox by this factor for focused re-seed proposals
@@ -105,6 +107,18 @@ def _mask_to_patch(mask: np.ndarray, gh: int = 64, gw: int = 64) -> torch.Tensor
         return _mask_to_patch_indicator(mask, gh, gw).cuda()
     except ValueError:
         return torch.full((gh * gw,), 1.0 / (gh * gw), device="cuda")
+
+
+def _click_centrality(mask: np.ndarray, cx: float, cy: float) -> float:
+    """How deep the click sits in the mask, relative to the mask's deepest
+    interior point (its distance-transform peak). 1.0 = click is the mask's
+    center; near 0 = click is at its edge. A user clicks the object's
+    interior, so the true object scores high while a merged blob (whose
+    interior peak lies elsewhere) scores low. Mirrors
+    video/scripts/eval_davis2016.py::click_centrality."""
+    dt = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 3)
+    dmax = float(dt.max())
+    return float(dt[int(cy), int(cx)]) / dmax if dmax > 0 else 0.0
 
 
 def _iou_pick(props: list, ref: np.ndarray, click_xy: tuple | None) -> np.ndarray | None:
@@ -208,6 +222,7 @@ def _overlay(frame: np.ndarray, mask: np.ndarray, color: tuple, alpha: float = 0
 
 def run_pipeline(clip: str, click_x: float, click_y: float,
                  refine: bool, feat_size: int = 1024, use_probe: bool = True,
+                 probe_reseed: bool = False,
                  progress=gr.Progress()) -> str:
     """Run the full pipeline and return path to output video."""
     n = davis.num_frames(clip)
@@ -216,25 +231,52 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
 
     click_xy = (click_x * W, click_y * H)
 
-    img_sized = cv2.resize(frame0, (feat_size, feat_size))
-    with torch.no_grad():
-        feats_prev = _dino.extract(img_sized, normalize=False)["feats"].cuda().float()
+    # Precompute DINOv3 features for every frame up front in batched forward passes
+    # (chunked so VRAM use stays bounded) instead of one image at a time inside the
+    # per-frame loop below. A single-image forward under-utilises the GPU; batching
+    # trades more VRAM for much better throughput. Chunk size scales down with
+    # feat_size since a 2048px frame costs ~4x the activations of a 1024px one.
+    progress(0.0, desc="Extracting DINOv3 features for all frames…")
+    chunk = max(2, int(FEATURE_BATCH_SIZE * (1024 / feat_size) ** 2))
+    frames_full = [davis.load_frame(clip, i) for i in range(n)]
+    frames_sized = [cv2.resize(f, (feat_size, feat_size)) for f in frames_full]
+    feats_all: list[torch.Tensor] = []
+    for start in range(0, n, chunk):
+        batch = frames_sized[start:start + chunk]
+        results = _dino.extract_batch_same_size(batch, normalize=False)
+        feats_all.extend(r["feats"] for r in results)  # each: [gh, gw, D] cpu float32
+        progress(0.03 * min(start + chunk, n) / n,
+                 desc=f"Extracting features {min(start + chunk, n)}/{n}")
+
+    feats_prev_raw = feats_all[0]
+    feats_prev = feats_prev_raw.cuda().float()
     feats_prev_norm = F.normalize(feats_prev, dim=-1)
     gh_feat, gw_feat = feats_prev_norm.shape[:2]  # 64 at 1024px, 128 at 2048px
 
     progress(0.05, desc="Seeding frame 0 with CuVLER + conquer…")
     proposals = _divider.predict(frame0)
     proposals = run_conquer(_conquer_bb, frame0, proposals)
-    # Frame 0: pick seed containing click.
-    # If the largest candidate covers > 40% of the frame it's a merged blob
-    # (e.g. all 3 dancers detected as one region) — prefer smallest in that case.
+    # Frame 0: pick seed containing click — hybrid rule, matching the paper and
+    # eval_davis2016.py --seed-pick hybrid. Largest click-containing candidate,
+    # unless it carries the merged-blob signature: >40% of the frame → smallest
+    # valid instead; >15% of the frame AND the click sits peripherally in it
+    # (centrality < 0.6) → re-rank near-best-centrality candidates, keep largest.
     cx0, cy0 = click_xy
     containing0 = [m for m in proposals if m[int(cy0), int(cx0)] > 0]
     if containing0:
+        area_floor = H * W * 0.005
+        valid0 = [m for m in containing0 if m.sum() >= area_floor] or containing0
         largest0 = max(containing0, key=lambda m: m.sum())
-        if largest0.sum() > H * W * 0.40:
-            valid0 = [m for m in containing0 if m.sum() >= H * W * 0.005]
-            seed = min(valid0, key=lambda m: m.sum()) if valid0 else largest0
+        a_frac = largest0.sum() / (H * W)
+        if a_frac > 0.40:
+            small0 = [m for m in containing0 if m.sum() >= area_floor]
+            seed = min(small0, key=lambda m: m.sum()) if small0 else largest0
+        elif a_frac > 0.15 and _click_centrality(largest0, cx0, cy0) < 0.6:
+            pool0 = [m for m in valid0 if m is not largest0] or valid0
+            scored0 = [(_click_centrality(m, cx0, cy0), m) for m in pool0]
+            best_c = max(s for s, _ in scored0)
+            seed = max([m for s, m in scored0 if s >= 0.8 * best_c],
+                       key=lambda m: m.sum())
         else:
             seed = largest0
     else:
@@ -247,8 +289,10 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
     frame_prev = frame0
 
     # Test-time adaptation: train a frame-0 instance probe on the seed mask.
+    # Needed by fusion (use_probe) and/or reseed arbitration (probe_reseed);
+    # fused into the OT heat only when use_probe is on.
     probe = None
-    if use_probe and cur_mask.sum() > 0:
+    if (use_probe or probe_reseed) and cur_mask.sum() > 0:
         progress(0.04, desc="Training instance probe (test-time adaptation)…")
         y0 = _patch_labels(cur_mask, gh_feat, gw_feat)
         probe = _train_probe(feats_prev_norm.reshape(-1, feats_prev_norm.shape[-1]), y0)
@@ -257,18 +301,16 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
 
     # frame 0
     soft0 = cur_mask.astype(np.float32)
-    display0 = crf_refine(frame0, soft0, dino_feats=_dino.extract(img_sized, normalize=False)["feats"].cpu()) \
+    display0 = crf_refine(frame0, soft0, dino_feats=feats_prev_raw) \
         if refine and crf_confidence(soft0) >= CRF_CONF else cur_mask
     frames_out.append(_overlay(frame0, display0, (0, 120, 255)))
 
     for fidx in range(1, n):
         progress(0.05 + 0.90 * fidx / n, desc=f"Frame {fidx}/{n-1}")
-        frame = davis.load_frame(clip, fidx)
-        img_sized = cv2.resize(frame, (feat_size, feat_size))
+        frame = frames_full[fidx]
 
-        with torch.no_grad():
-            feats_cur_raw = _dino.extract(img_sized, normalize=False)["feats"]
-            feats_cur = feats_cur_raw.cuda().float()
+        feats_cur_raw = feats_all[fidx]
+        feats_cur = feats_cur_raw.cuda().float()
         feats_cur_norm = F.normalize(feats_cur, dim=-1)
         gh_cur, gw_cur = feats_cur_norm.shape[:2]
 
@@ -281,7 +323,7 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
         # the memoryless probe re-acquires the instance after occlusion and rejects
         # look-alike distractors. The fused (probe-corrected) mask feeds back into
         # the chain, so a transient overlap no longer causes permanent identity loss.
-        if probe is not None:
+        if probe is not None and use_probe:
             score = _probe_score(probe, feats_cur_norm)  # [N_b] in [0,1]
             heat = (1.0 - PROBE_FUSE_WEIGHT) * heat + PROBE_FUSE_WEIGHT * score
 
@@ -291,21 +333,57 @@ def run_pipeline(clip: str, click_x: float, click_y: float,
         soft_up = heat_up / (heat_up.max() + 1e-8)
         ot_mask = (soft_up > OT_THRESH).astype(np.uint8)
         cur_mask = ot_mask
+        # Propagation always continues on the plain-bilinear mask, never on the
+        # guided-filtered display mask below. Feeding an edge-snapped mask back
+        # in compounds erosion frame over frame (measured: mean IoU vs DAVIS GT
+        # on "dog" drops 0.696→0.564 over 60 frames if display and propagation
+        # share the same mask). Decoupled, guided-filter display is a slight net
+        # IoU win (0.696→0.701) with no erosion, since it never re-enters the chain.
         patch = _mask_to_patch(ot_mask, gh=gh_feat, gw=gw_feat)
 
         if RESEED_INTERVAL > 0 and fidx % RESEED_INTERVAL == 0:
             props = _divider.predict(frame)
             props += _crop_proposals(frame, ot_mask, RESEED_CROP_CONTEXT)
             props = run_conquer(_conquer_bb, frame, props)
-            candidate = _iou_pick(props, ot_mask, click_xy)
-            if candidate is not None and _iou(ot_mask, candidate) >= RESEED_THRESH:
+            accept, candidate = False, None
+            if probe_reseed and probe is not None:
+                # Identity-arbitrated reseed: score candidates (and the incumbent)
+                # by soft-IoU against the frame-0 instance probe; the candidate
+                # wins only if it beats the incumbent. Coherence with a drifted
+                # track cannot satisfy this gate, and a fully drifted track can
+                # be re-acquired (no overlap with the incumbent required).
+                pscore = _probe_score(probe, feats_cur_norm)
+
+                def _probe_soft_iou(m: np.ndarray) -> float:
+                    y = _patch_labels(m, gh_cur, gw_cur)
+                    inter = (pscore * y).sum()
+                    return float(inter / (pscore.sum() + y.sum() - inter + 1e-8))
+
+                incumbent = _probe_soft_iou(ot_mask) if ot_mask.sum() > 0 else 0.0
+                scored = [(_probe_soft_iou(m), m) for m in props if m.sum() > 0]
+                if scored:
+                    best_s, candidate = max(scored, key=lambda t: t[0])
+                    accept = best_s > incumbent
+            else:
+                candidate = _iou_pick(props, ot_mask, click_xy)
+                accept = candidate is not None and _iou(ot_mask, candidate) >= RESEED_THRESH
+            if candidate is not None and accept:
                 cur_mask = candidate
                 patch = _mask_to_patch(cur_mask, gh=gh_feat, gw=gw_feat)
 
+        # Guided-filter boundary polish: snaps the blocky patch-grid mask to real
+        # image edges for display only. Cheap, unconditional (unlike CRF, which
+        # only fires above a confidence gate), and never fed back into propagation.
+        guide = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        mask_guided = cv2.ximgproc.guidedFilter(
+            guide=guide, src=cur_mask.astype(np.float32), radius=8, eps=1e-3
+        )
+        display_mask = (mask_guided > 0.5).astype(np.uint8)
+
         if refine and crf_confidence(soft_up) >= CRF_CONF:
-            display = crf_refine(frame, soft_up, dino_feats=feats_cur_raw.cpu())
+            display = crf_refine(frame, soft_up, dino_feats=feats_cur_raw)
         else:
-            display = cur_mask
+            display = display_mask
 
         frames_out.append(_overlay(frame, display, (0, 120, 255)))
         feats_prev_norm = feats_cur_norm
@@ -355,12 +433,13 @@ def on_click(clip: str, refine: bool, evt: gr.SelectData):
 
 
 def on_run(clip: str, cx_norm: float, cy_norm: float, refine: bool, quality: str,
-           use_probe: bool, progress=gr.Progress()):
+           use_probe: bool, probe_reseed: bool, progress=gr.Progress()):
     if cx_norm is None:
         return None, "Click on the object in frame 0 first."
     feat_size = 2048 if quality == "High (2048px — sharper boundaries, ~8× slower)" else 1024
     video_path = run_pipeline(clip, cx_norm, cy_norm, refine, feat_size=feat_size,
-                              use_probe=use_probe, progress=progress)
+                              use_probe=use_probe, probe_reseed=probe_reseed,
+                              progress=progress)
     return video_path, "Done."
 
 
@@ -380,6 +459,11 @@ with gr.Blocks(title="VideoUnSAM") as demo:
             )
             refine_cb = gr.Checkbox(value=True, label="Dense CRF refinement (unsupervised boundary sharpening)")
             probe_cb = gr.Checkbox(value=True, label="Instance probe (test-time adaptation — re-acquires after occlusion, rejects look-alikes)")
+            probe_reseed_cb = gr.Checkbox(
+                value=False,
+                label="Probe-gated reseed (identity-arbitrated: rescues background "
+                      "lock-in, e.g. bmx-trees; may hurt clips with big pose/scale "
+                      "change, e.g. motocross-jump)")
             quality_radio = gr.Radio(
                 choices=["Standard (1024px — fast)", "High (2048px — sharper boundaries, ~8× slower)"],
                 value="Standard (1024px — fast)",
@@ -408,7 +492,8 @@ with gr.Blocks(title="VideoUnSAM") as demo:
     # run pipeline
     run_btn.click(
         fn=on_run,
-        inputs=[clip_dd, cx_state, cy_state, refine_cb, quality_radio, probe_cb],
+        inputs=[clip_dd, cx_state, cy_state, refine_cb, quality_radio, probe_cb,
+                probe_reseed_cb],
         outputs=[out_video, status_txt],
     )
 

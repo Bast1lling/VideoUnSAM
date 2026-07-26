@@ -66,7 +66,7 @@ Frame 0 (user click)
 └─────────────────────┘
 ```
 
-**Instance probe (test-time adaptation).** On the user's click we spend ~1–2 s training a 1-layer linear probe to recognise *that specific object* — positive examples are the seed-mask patches, negatives are the rest of the frame, on frozen DINOv3 features. Fully label-free (supervision is the unsupervised seed). Fused with OT each frame, it fixes the two failure modes no cost-term tweak could: **identity switch** in crowds (dancing 0.342→0.439) and **background confusion** (bmx-trees 0.076→0.229, 3×), and never hurts clean clips. Because it is memoryless it re-acquires the object after an occlusion where plain OT was permanently lost. On by default; see [the detailed write-up](#test-time-adaptation-per-clip-instance-probe-the-breakthrough). *(Per-clip verified; full 20-clip aggregate eval with the probe is pending — the table below is the OT+reseed+CRF pipeline without it.)*
+**Instance probe (test-time adaptation).** On the user's click we spend ~1–2 s training a 1-layer linear probe to recognise *that specific object* — positive examples are the seed-mask patches, negatives are the rest of the frame, on frozen DINOv3 features. Fully label-free (supervision is the unsupervised seed). Fused with OT each frame, it attacks the two failure modes no cost-term tweak could: **identity switch** in crowds and **background confusion** (the probe learns to reject look-alike trees/grass). Because it is memoryless it re-acquires the object after an occlusion where plain OT was permanently lost. Over 20 DAVIS clips it is **net +0.031 J&F (0.603 → 0.634)** — but it is a *trade*, not a free win: 13 clips improve (libby +0.29, bmx-trees +0.18, drift-straight +0.11), 6 regress (motocross-jump −0.25, dog −0.09) where the probe overfits frame-0 appearance or its coarse score blurs an already-clean boundary. On by default (the aggregate justifies it); toggle off for clips with large pose/scale change. See [the detailed write-up](#test-time-adaptation-per-clip-instance-probe-the-breakthrough).
 
 ### Results — DAVIS 2016 val (20 clips, fully annotation-free)
 
@@ -76,7 +76,8 @@ Frame 0 (user click)
 |---|---|---|---|
 | No reseed | 0.592 | 0.496 | 0.544 |
 | + Periodic reseed | 0.621 | 0.523 | 0.572 |
-| + Selective Dense CRF | **0.635** | **0.571** | **0.603** |
+| + Selective Dense CRF | 0.635 | 0.571 | 0.603 |
+| + Instance probe (TTA) | **0.661** | **0.606** | **0.634** |
 
 **Per-clip breakdown** (full pipeline, J&F):
 
@@ -102,6 +103,23 @@ Frame 0 (user click)
 | parkour | 0.833 | 0.808 | 0.820 | |
 | scooter-black | 0.350 | 0.449 | 0.399 | low contrast against dark background |
 | soapbox | 0.529 | 0.405 | 0.467 | |
+
+**Per-clip instance-probe effect** (J&F, sorted by Δ; aggregate **0.603 → 0.634**, +0.031):
+
+| Clip | Base | +Probe | Δ | | Clip | Base | +Probe | Δ |
+|---|---|---|---|---|---|---|---|---|
+| libby | 0.471 | 0.761 | **+0.290** | | scooter-black | 0.399 | 0.431 | +0.032 |
+| bmx-trees | 0.130 | 0.311 | **+0.181** | | breakdance | 0.725 | 0.755 | +0.030 |
+| drift-straight | 0.619 | 0.725 | +0.106 | | car-roundabout | 0.758 | 0.767 | +0.009 |
+| kite-surf | 0.210 | 0.294 | +0.084 | | drift-chicane | 0.001 | 0.001 | 0.000 |
+| soapbox | 0.467 | 0.537 | +0.070 | | dance-twirl | 0.768 | 0.760 | −0.008 |
+| car-shadow | 0.706 | 0.754 | +0.048 | | camel | 0.760 | 0.748 | −0.012 |
+| parkour | 0.820 | 0.868 | +0.048 | | paragliding-launch | 0.732 | 0.719 | −0.013 |
+| goat | 0.794 | 0.839 | +0.045 | | blackswan | 0.929 | 0.896 | −0.033 |
+| cows | 0.794 | 0.836 | +0.042 | | dog | 0.822 | 0.730 | −0.092 |
+| horsejump-high | 0.595 | 0.626 | +0.031 | | motocross-jump | 0.559 | 0.314 | **−0.245** |
+
+13 clips improve, 6 regress, 1 neutral. Wins concentrate on the hard cases (background confusion, small/lost objects, crowds); losses come from frame-0 appearance overfit under large pose/scale change (motocross-jump) and coarse-probe boundary blur on already-clean clips (dog, blackswan — both lose mainly F).
 
 **Known failure modes:**
 - *Sub-patch objects* (drift-chicane): at the default 64×64 grid (16 px/patch), objects smaller than ~2 patches score near zero. The 128×128 grid (`--feat-size 2048`, 8 px/patch) partially addresses this but drift-chicane's car is still sub-patch even at that resolution.
@@ -245,15 +263,17 @@ The probe is **memoryless** — it re-recognises the instance from scratch every
 
 **Fusion** `heat = 0.5·OT + 0.5·probe`, feeding the fused (probe-corrected) mask back into the OT chain, gets the best of both — OT carries the brief overlap, the probe revives identity after and rejects look-alikes:
 
+First, against the **bare OT chain** (no reseed/CRF, in `video/scripts/probe_tta.py`) the fusion `heat = 0.5·OT + 0.5·probe` — feeding the fused mask back into the chain so OT carries the overlap and the probe revives identity after — is a large, uniform win:
+
 | Clip | OT chain only | + Probe fusion | Δ | Failure mode addressed |
 |---|---|---|---|---|
-| dancing | 0.342 | **0.439** | +0.097 | identity switch (3 dancers) |
+| dancing (DAVIS 2017) | 0.342 | **0.439** | +0.097 | identity switch (3 dancers) |
 | bmx-trees | 0.076 | **0.229** | +0.153 (3×) | background confusion (trees) |
 | dog | 0.726 | **0.832** | +0.106 | drift |
 | camel | 0.643 | **0.708** | +0.065 | drift |
 | blackswan | 0.788 | 0.789 | +0.001 | (already near-perfect) |
 
-(These OT baselines are the bare chain in `video/scripts/probe_tta.py` — no reseed/CRF — so lower than the full-pipeline numbers above; the controlled probe-vs-no-probe Δ is what matters.) The probe helps **both** hard failure modes — identity switch *and* background confusion — and never hurts. It is wired into `demo.py` (on by default, toggle "Instance probe") and `video/scripts/probe_tta.py` (`--mode probe|ot|fuse`).
+**But against the *full* pipeline (reseed + CRF) the picture is a trade, not a uniform win** — see the per-clip table in [Results](#results--davis-2016-val-20-clips-fully-annotation-free). Reseed already corrects most drift, so on clean clips the probe is redundant *and* its coarse patch-level score blurs the boundary CRF would otherwise sharpen (dog J&F 0.822→0.730, all in F). The 20-clip aggregate is **net +0.031 J&F (0.603 → 0.634)**: the hard-case wins (libby +0.29, bmx-trees +0.18, drift-straight +0.11) outweigh the regressions (motocross-jump −0.25 from frame-0 appearance overfit during the jump; dog/blackswan boundary blur). It is wired into `demo.py` (on by default, toggle "Instance probe") and `video/scripts/eval_davis2016.py` / `probe_tta.py` (`--probe`, `--mode probe|ot|fuse`).
 
 **What it does *not* fix:** the overlap frame itself. On dancing, frames 44–46 (the instant the bodies physically occlude) still drop to ~0.10 — at true occlusion the target is literally hidden, so no appearance method can segment it. The win is that this is now a transient dip that recovers (fusion: 0.10 at f45 → 0.55 at f50 → 0.41 at f61) rather than the permanent death of the OT-only chain (0.000 from f52 on). Frame ~45 remains the genuine hard floor; everything after it is recovered.
 
@@ -316,8 +336,11 @@ python -m video.scripts.probe_tta --clip dancing --instance-id 1 \
     --mode fuse --fuse-weight 0.5 \
     --out video/outputs/dancing_probe.mp4
 
-# Full DAVIS 2016 val eval (20 clips, ~30 min)
+# Full DAVIS 2016 val eval (20 clips, ~15 min) — J&F 0.603
 python -m video.scripts.eval_davis2016 --refine --crf-conf 0.65 --crf-compat 20
+
+# …with the instance probe (test-time adaptation) — J&F 0.634 (+0.031)
+python -m video.scripts.eval_davis2016 --refine --crf-conf 0.65 --crf-compat 20 --probe
 
 # Full eval at 128×128 grid (~8× slower, higher boundary precision)
 python -m video.scripts.eval_davis2016 --refine --crf-conf 0.65 --crf-compat 20 --feat-size 2048
@@ -351,7 +374,7 @@ pip install pydensecrf
 | `video/scripts/probe_tta.py` | Test-time-adaptation instance probe; `--mode probe\|ot\|fuse` — appearance-based re-acquisition fused with OT |
 | `video/refine/dense_crf.py` | Dense CRF boundary refinement |
 | `video/scripts/propagate_reseed.py` | Main CLI with video output; `--feat-size`, `--spatial-weight`, `--motion-weight` |
-| `video/scripts/eval_davis2016.py` | DAVIS 2016 aggregate eval; `--feat-size`, `--spatial-weight`, `--motion-weight` |
+| `video/scripts/eval_davis2016.py` | DAVIS 2016 aggregate eval; `--feat-size`, `--spatial-weight`, `--motion-weight`, `--probe` |
 | `video/divide/click_grow.py` | Click-seeded feature-similarity mask extraction |
 | `DinoMaskExtraction/` | DINOv3 feature inspector (Basti) |
 
