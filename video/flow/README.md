@@ -139,6 +139,74 @@ eval mode instead of silently misbehaving.
 "will take an extremely long time on a single machine" and that they ran it
 distributed across many shards.
 
+## 5. PyTorch checkpoint (for use inside the VideoUnSAM pipeline)
+
+The TF checkpoint can be converted so flow runs on plain `torch` + `torchvision`,
+with no TensorFlow and no archived `tensorflow-addons` — which is what makes it
+usable in the same process as DINOv3 rather than as a separate offline stage.
+
+```bash
+git clone https://github.com/ChristophReich1996/SMURF.git ~/smurf-pytorch
+source ~/gr-smurf/.venv-tf/bin/activate
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+cd ~/smurf-pytorch
+python convert_weights_to_pt.py \
+    --tf_checkpoint $HOME/smurf_ckpts/ytvis_ft15k/ckpt-15 \
+    --pt_checkpoint_path $HOME/smurf_ckpts/ytvis_ft15k.pt
+```
+
+`--tf_checkpoint` takes the checkpoint **prefix** (`.../ckpt-15`), not the
+directory and not a `.index`/`.data` file. Output is ~21MB versus the 61MB TF
+checkpoint, because Adam optimizer state does not carry over — inference does not
+need it.
+
+### Verify the conversion — do not skip this
+
+```bash
+cd ~/gr-smurf && export PYTHONPATH=$HOME/VideoUnSAM
+python -m video.flow.verify_pt_conversion \
+    --tf_ckpt_dir=$HOME/smurf_ckpts/ytvis_ft15k \
+    --pt_ckpt=$HOME/smurf_ckpts/ytvis_ft15k.pt \
+    --pt_repo=$HOME/smurf-pytorch \
+    --height=296 --width=640
+```
+
+Result on `blackswan`: **mean EPE 0.0667 px between the two implementations.**
+
+### Two gotchas the verification caught
+
+**1. Channel order is NOT the same.**
+
+| | Convention |
+|---|---|
+| TF SMURF (`net.infer`) | `(dy, dx)` |
+| PyTorch port (`raft_smurf`) | `(dx, dy)` |
+
+Measured EPE was **0.067 px** assuming `(dx, dy)` versus **9.13 px** assuming
+`(dy, dx)` — a 137× gap, so there is no ambiguity. Downstream code must account
+for this. A transposed flow field still renders as a plausible colour wheel, so
+this is invisible to visual inspection; `warp_mask()` in
+`eval_flow_warp_davis.py` documents the same trap.
+
+**2. Both repos define a top-level package named `smurf`, and they collide.**
+
+Google's TF version has no `__init__.py` (namespace package); the PyTorch port
+has one (regular package). Python's import machinery prefers a regular package
+over a namespace package *regardless of `sys.path` order*, so putting
+`smurf-pytorch` on `PYTHONPATH` breaks the TF import with
+`cannot import name 'smurf_flags' from 'smurf'`. Import one, evict it from
+`sys.modules`, then import the other — `verify_pt_conversion.py` shows the
+pattern.
+
+### Resolution constraint
+
+RAFT's feature encoder downsamples by 8, so both input dimensions must be
+divisible by 8. DAVIS is 480×854 and 854 % 8 == 6, so native frames are rejected.
+Run at 296×640 (both divisible by 8, and the training resolution), then rescale
+the flow — remembering to scale the **vectors** as well as the grid, since a 10px
+displacement at 640 wide is 13.3px at 854 wide.
+
 ## Open issue: frame stride
 
 YouTube-VIS stores only every **5th** frame of the source video (`00000, 00005,
