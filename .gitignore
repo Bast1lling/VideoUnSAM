@@ -1,4 +1,5 @@
 *.pth
+*.pt
 *.pyc
 
 # json outputs (annotation files, sweep results) but NOT code-adjacent json like davis_split.json
@@ -38,3 +39,4 @@ __pycache__/
 .idea/
 maskcut/
 wandb/
+.DS_Store
