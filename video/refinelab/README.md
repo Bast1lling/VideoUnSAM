@@ -53,10 +53,12 @@ python -m video.flow.dump_flow_masks \
     --checkpoint ytvis_ft15k.pt
 ```
 
-Writes `dump/flow/<clip>/<fidx>.npz` — the previous frame's `ot_mask` warped forward
-with SMURF flow, bit-packed like everything else in the dump. `bench.py` loads it with
-plain numpy, no TF import needed at bench time. Note this warps the chain's *actual*
-`ot_mask` (right or wrong), not ground truth — deliberately different from
+Writes `dump/flow/<clip>/<fidx>.npz` — the previous frame's CONTINUOUS heat
+(`soft_up`, not the already-thresholded `ot_mask`; blending two binary fields
+silently breaks `blend`, see the module docstring) warped forward with SMURF
+flow, as float16. `bench.py` loads it with plain numpy, no TF import needed
+at bench time. Note this warps the chain's *actual* heat (right or wrong),
+not ground truth — deliberately different from
 `video/flow/eval_flow_warp_davis.py`'s oracle-initialised GT-to-GT numbers, since this
 is what a real refiner would have to work with at inference time.
 

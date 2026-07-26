@@ -77,12 +77,34 @@ def compute_backward_flow(model: torch.nn.Module, frame_dst: np.ndarray,
     return flow[: H_p - pad_h, : W_p - pad_w] if (pad_h or pad_w) else flow
 
 
-def warp_mask_backward(mask_src: np.ndarray, flow_bw: np.ndarray) -> np.ndarray:
-    """Gather-warp mask_src into the grid flow_bw is defined on.
+def warp_soft_backward(field_src: np.ndarray, flow_bw: np.ndarray) -> np.ndarray:
+    """Gather-warp a CONTINUOUS field (e.g. a soft heatmap) into the grid
+    flow_bw is defined on. No thresholding -- see warp_mask_backward below for
+    why that matters when the result gets blended with another soft field
+    rather than used as a final mask.
 
-    warped(x) = mask_src(x + flow_bw(x)), flow_bw channel order (dx, dy) --
-    see module docstring point 2. This is the corrected counterpart of
-    eval_flow_warp_davis.py's warp_mask, which assumed TF-SMURF's (dy, dx).
+    warped(x) = field_src(x + flow_bw(x)), flow_bw channel order (dx, dy) --
+    see module docstring point 2.
+    """
+    h, w = field_src.shape
+    dx = flow_bw[..., 0].astype(np.float32)
+    dy = flow_bw[..., 1].astype(np.float32)
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    map_x = xs + dx
+    map_y = ys + dy
+    return cv2.remap(field_src.astype(np.float32), map_x, map_y,
+                     interpolation=cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def warp_mask_backward(mask_src: np.ndarray, flow_bw: np.ndarray) -> np.ndarray:
+    """Gather-warp a binary mask_src, thresholding the result at 0.5.
+
+    Blending two ALREADY-BINARY masks with a linear weight doesn't behave as
+    an interpolation -- e.g. (1-blend)*a + blend*b > 0.5 collapses to exactly
+    3 regimes (pure a, intersection, pure b) as blend crosses 0.5, not a
+    smooth sweep. Use warp_soft_backward instead for anything that will be
+    blended with another continuous field before its own final threshold.
     """
     h, w = mask_src.shape
     dx = flow_bw[..., 0].astype(np.float32)

@@ -97,14 +97,14 @@ def load_frame(dump: Path, clip: str, fidx: int, want_props: bool, want_pca: boo
 
     pca3 = z["pca3"] if (want_pca and "pca3" in z) else None
 
-    flow_mask = None
+    flow_heat = None
     if want_flow:
         fp = dump / "flow" / clip / f"{fidx:05d}.npz"
         if fp.exists():
             fz = np.load(fp)
-            flow_mask = _unpack(fz["flow_mask"], fz["shape"]).astype(np.float32)
+            flow_heat = fz["flow_heat"].astype(np.float32)
 
-    return soft_up, frame_rgb, gt, props, pca3, flow_mask
+    return soft_up, frame_rgb, gt, props, pca3, flow_heat
 
 
 def clips_in(dump: Path) -> list[str]:
@@ -128,13 +128,13 @@ def evaluate(dump: Path, refiner_name: str, params: dict,
     for clip in clips:
         js, fs = [], []
         for fidx in frames_in(dump, clip):
-            soft_up, frame_rgb, gt, props, pca3, flow_mask = load_frame(
+            soft_up, frame_rgb, gt, props, pca3, flow_heat = load_frame(
                 dump, clip, fidx, want_props, want_pca, want_flow)
             kw = dict(params)
             if want_pca:
                 kw["pca3"] = pca3
             if want_flow:
-                kw["flow_mask"] = flow_mask
+                kw["flow_heat"] = flow_heat
             pred = fn(soft_up, frame_rgb, props, **kw)
             if gt.sum() > 0:
                 js.append(j_score(pred, gt))
