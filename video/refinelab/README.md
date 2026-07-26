@@ -39,18 +39,18 @@ Then pull it down:
 scp -P 58022 -r s0041@<workstation>.in.tum.de:/storage/slurm/s0041/dumps/davis2016_default ./dumps/
 ```
 
-## Step 1b — flow sidecar (TF venv, optional, once)
+## Step 1b — flow sidecar (same PyTorch venv, optional, once)
 
-Only needed for `flow_snap` / `flow_guided_snap`. SMURF (`video/flow/`) needs the
-project's separate TF venv (`.venv-tf`, see `video/flow/README.md`) -- it cannot be
-imported into the same process as `dump_artifacts.py`, which is PyTorch/DINOv3. So
-this is a second pass over the *existing* dump, not an extra flag on step 1:
+Only needed for `flow_snap` / `flow_guided_snap`. Uses `ytvis_ft15k.pt`
+(SMURF-YTVIS converted to a plain PyTorch RAFT checkpoint, loaded via the
+vendored `video/flow/smurf_raft/` -- no TensorFlow, no separate venv). Still a
+second pass over the *existing* dump rather than an extra flag on step 1,
+since it's a different model with its own inference cost:
 
 ```bash
-source .venv-tf/bin/activate
 python -m video.flow.dump_flow_masks \
     --dump dumps/davis2016_default \
-    --checkpoint_dir=$HOME/smurf_ckpts/ytvis_finetuned
+    --checkpoint ytvis_ft15k.pt
 ```
 
 Writes `dump/flow/<clip>/<fidx>.npz` — the previous frame's `ot_mask` warped forward
